@@ -4,10 +4,28 @@ A native Mudlet interface for Chronicles of Krynn, distributed as [KrynnNativeUI
 
 ## Installation
 
-1. Download the `.mpackage` file.
-2. Open your Chronicles of Krynn profile in Mudlet and install the file through Mudlet's Package Manager.
+### First: remove the original server-provided UI
+
+If your Krynn profile already has the original UI downloaded from the MUD server, remove that package before installing Krynn Native UI. Running both interfaces can leave overlapping panels or competing screen borders.
+
+1. Open your **Chronicles of Krynn profile** in Mudlet and disconnect from the game while changing packages.
+2. Open **Preferences / Settings** (`Alt+P` on Windows/Linux). Find **Allow server to install script packages** and turn it off for this profile. In newer Mudlet versions it is under **Privacy and security → Server Permissions**; the location and wording may differ in older versions. Save/apply if your version provides that button. This prevents the original UI from being automatically installed again when you reconnect.
+3. Open **Package Manager** from the toolbar (`Alt+O` on Windows/Linux).
+4. Select the **original Krynn UI package supplied by the server**, then click **Uninstall** and confirm. Identify it using the package name and details shown in your profile; the installed name may differ between server package versions. Remove that UI package only, leaving unrelated packages and personal scripts in place.
+5. Save the profile, close it, and reopen it to clear any panels or temporary handlers left by the old package.
+
+Turning off server package installation does not uninstall a package that is already present, so complete both the preference change and the uninstall. Keep **MSDP enabled**: the new UI still needs the server's live character and map data. You do not need to disable GMCP or ATCP to stop automatic package installation.
+
+If the old UI returns after reconnecting, check the server package installation preference again and remove the reinstalled original package. If you cannot identify the original package, ask for its exact name before uninstalling an uncertain entry.
+
+### Install Krynn Native UI
+
+1. Download [KrynnNativeUI_v0.8.10.mpackage](KrynnNativeUI_v0.8.10.mpackage).
+2. In your Krynn profile, open **Package Manager → Install** and select the downloaded file.
 3. Connect to the game. The interface uses Mudlet's Geyser widgets and the game's MSDP data; information appears as the server supplies it.
-4. Type `kui status` to inspect the UI status, or `kui connect` to request protocol subscriptions again.
+4. Type `kui status` to inspect the UI status, or `kui connect` to request protocol subscriptions again. The original server-provided interface should no longer be visible.
+
+Mudlet references: [Package Manager](https://wiki.mudlet.org/w/Manual:Package_Manager) and [Profile Preferences](https://wiki.mudlet.org/w/Manual:Profile_Preferences).
 
 ## Features
 
