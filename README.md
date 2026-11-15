@@ -1,6 +1,10 @@
 # Krynn Native UI for Mudlet
 
-A native Mudlet interface for Chronicles of Krynn, distributed as [KrynnNativeUI_v0.8.10.mpackage](KrynnNativeUI_v0.8.10.mpackage). The package contains the Lua UI script in Mudlet XML format.
+A native Mudlet interface for Chronicles of Krynn, distributed as [KrynnNativeUI.mpackage](KrynnNativeUI.mpackage). The package contains the Lua UI script in Mudlet XML format.
+
+## Browse the source
+
+Read the [complete Lua code](source/KrynnNativeUI.lua), the [package XML](source/package/KrynnNativeUI.xml), or the [source inventory and feature-by-feature code guide](source/README.md). All archive contents are expanded in `source/`; the installable `.mpackage` remains available above.
 
 ## Installation
 
@@ -20,14 +24,34 @@ If the old UI returns after reconnecting, check the server package installation 
 
 ### Install Krynn Native UI
 
-1. Download [KrynnNativeUI_v0.8.10.mpackage](KrynnNativeUI_v0.8.10.mpackage).
+1. Download [KrynnNativeUI.mpackage](KrynnNativeUI.mpackage).
 2. In your Krynn profile, open **Package Manager → Install** and select the downloaded file.
 3. Connect to the game. The interface uses Mudlet's Geyser widgets and the game's MSDP data; information appears as the server supplies it.
 4. Type `kui status` to inspect the UI status, or `kui connect` to request protocol subscriptions again. The original server-provided interface should no longer be visible.
 
 Mudlet references: [Package Manager](https://wiki.mudlet.org/w/Manual:Package_Manager) and [Profile Preferences](https://wiki.mudlet.org/w/Manual:Profile_Preferences).
 
-## Features
+## Stable download and server-provided installation
+
+The current version is **0.8.10**. Use the stable filename for new installs and future updates:
+
+**[Download KrynnNativeUI.mpackage](https://raw.githubusercontent.com/legimia/mudlet-ui/main/KrynnNativeUI.mpackage)**
+
+The older [versioned package](KrynnNativeUI_v0.8.10.mpackage) is retained as a snapshot. If you already installed that versioned package, uninstall it through Package Manager and reopen the profile before installing `KrynnNativeUI.mpackage`, so there is only one installed copy.
+
+A server administrator can optionally advertise this package through Mudlet's GMCP `Client.GUI` message:
+
+```text
+Client.GUI {"version":"0.8.10","url":"https://raw.githubusercontent.com/legimia/mudlet-ui/main/KrynnNativeUI.mpackage"}
+```
+
+Keep the package filename and URL stable. For each release, replace the archive at that path and update the advertised `version`; changing only the file does not trigger an update for clients that already have the advertised version. The script's internal version remains available through `kui status`.
+
+Players who opt into server-provided installation must enable **Allow server to install script packages**. The manual-install instructions above turn it off to prevent the original server UI from returning; only re-enable it once the server administrator has switched the advertised package. Moving the download to GitHub does not by itself remove an older package installed under another name.
+
+This repository change does not alter the MUD server's configuration. See Mudlet's [Client.GUI documentation](https://wiki.mudlet.org/w/Manual:GMCP_Extensions) for the server-side protocol.
+
+## Included features
 
 - A right sidebar with **Game UI** and **Chat History** views, plus bottom gauges for HP, PSP, movement, and experience.
 - **Player** panel with character identity, level, race, class, abilities, saving throws, and available combat, alignment, money, practice, position, and world-time values.
@@ -59,7 +83,7 @@ Mudlet references: [Package Manager](https://wiki.mudlet.org/w/Manual:Package_Ma
 
 ## Data and limitations
 
-Available information depends on the server's MSDP fields and room-output format. Missing values are left unavailable rather than invented. Room capture watches incoming text without hiding or modifying game output. Chat, map observations, room contents, and affects state are session-local; only UI dimensions are saved to `KrynnNativeUI_layout.txt` in the Mudlet profile. This repository supplies the installable package, not a separate unpacked development tree.
+Available information depends on the server's MSDP fields and room-output format. Missing values are left unavailable rather than invented. Room capture watches incoming text without hiding or modifying game output. Chat, map observations, room contents, and affects state are session-local; only UI dimensions are saved to `KrynnNativeUI_layout.txt` in the Mudlet profile. This repository supplies the installable package and its complete extracted source.
 
 ## Related Chronicles of Krynn tools
 

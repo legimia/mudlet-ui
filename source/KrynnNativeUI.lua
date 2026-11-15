@@ -1,0 +1,2038 @@
+-- Krynn Native UI v0.8.10: Centered ASCII viewport, MSDP HUD and room look-output capture.
+-- The Room tab parses only the contents section after [ Exits: ... ].
+KrynnNativeUI = KrynnNativeUI or {}
+local K = KrynnNativeUI
+if K.shutdown then pcall(K.shutdown) end
+K.version='0.8.10'; K.handlers={}; K.panel='player'; K.mapMode='ascii'; K.mapLegend=false
+K.visible=true; K.sidebarWidth=435; K.mapSplit=44; K.initialized=false; K.warnings={}
+-- Chat History is an alternative view INSIDE the same-sized right sidebar.
+-- Messages are retained only for this Mudlet session (up to 1200 lines).
+K.activeView='game'; K.chatFilter='all'; K.chatHistory={}; K.chatMax=1200; K.chatUnread=0; K.chatFlashOn=false; K.chatFlashTimer=nil; K.historyBatchCounts={}; K.historyBatchActive=false
+K.resizeWidthDrag=nil; K.resizeSplitDrag=nil
+-- Only store UI dimensions in the local Mudlet profile; no MUD data is saved.
+local layoutFile=getMudletHomeDir()..'/KrynnNativeUI_layout.txt'
+local function readLayout()
+ local f=io.open(layoutFile,'r');if not f then return end
+ local contents=f:read('*a');f:close()
+ local w,split=contents:match('^(%d+)%s+(%d+)')
+ if w then K.sidebarWidth=math.max(310,math.min(800,tonumber(w))) end
+ if split then K.mapSplit=math.max(28,math.min(67,tonumber(split))) end
+end
+local function saveLayout()
+ local f=io.open(layoutFile,'w')
+ if f then f:write(K.sidebarWidth..' '..K.mapSplit..'\n');f:close() end
+end
+readLayout()
+K.panX=0; K.panY=0; K.panDrag=nil
+K.graphX=0; K.graphY=0; K.graphZoom=22; K.graphDrag=nil; K.graphLastRoom=nil
+-- Session-local protocol observations, never saved or loaded from an external map.
+K.knownExits={}; K.mapRoomCache={}
+-- Each visible occurrence stays separate, including identical NPC descriptions.
+K.roomContents={objects={},npcs={},roomVnum=nil,seen=false}
+K.roomCapture=false; K.roomLines=0; K.roomWidgets={}
+K.roomSelected=nil; K.roomTargetOverrides={}
+-- AFFECTS payload contains SPELL_LIKE_AFFECTS and AFFECTED_BY sub-arrays.
+-- A clock is maintained per occurrence, updated from server duration values.
+K.affectsClock={}; K.affectWidgets={}; K.affectSignature=nil; K.affectsTimer=nil
+local function E(x) return tostring(x==nil and '' or x):gsub('&','&amp;'):gsub('<','&lt;'):gsub('>','&gt;'):gsub('"','&quot;') end
+local function field(t,...) if type(t)~='table' then return nil end for _,k in ipairs({...}) do if t[k]~=nil then return t[k] end end end
+local function decode(x)
+  if type(x)~='string' then return x end
+  local s=x:match('^%s*(.-)%s*$')
+  if s:sub(1,1)~='{' and s:sub(1,1)~='[' then return x end
+  if yajl and yajl.to_value then local ok,v=pcall(yajl.to_value,s); if ok and type(v)=='table' then return v end end
+  if json and json.decode then local ok,v=pcall(json.decode,s); if ok and type(v)=='table' then return v end end
+  return x
+end
+local function V(key) return type(msdp)=='table' and decode(msdp[key]) or nil end
+local function any(...) for _,k in ipairs({...}) do local v=V(k); if v~=nil and v~='' then return v end end end
+local function n(x) return tonumber(x) or 0 end
+local function pct(x,y) if n(y)<=0 then return 0 end return math.max(0, math.min(100, n(x)*100/n(y))) end
+local function pretty(k) return tostring(k):gsub('_',' '):gsub('(%l)(%u)','%1 %2'):lower():gsub('^%l',string.upper) end
+local function scalar(x) if type(x)=='table' then return nil end return tostring(x==nil and '' or x) end
+local C={bg='#181818',card='#282828',line='#4d4d4d',muted='#b3b3b3',text='#eee9df',hp='#28b765',move='#4eb9d7',psp='#4089ee',xp='#d6a41d'}
+local function line(k,v) if v==nil or v=='' or type(v)=='table' then return '' end return '<tr><td style="color:#b9b9b9;padding:3px 10px 3px 0">'..E(k)..'</td><td style="color:#eeeeee;padding:3px"><b>'..E(v)..'</b></td></tr>' end
+local function tableRows(rows) return '<table cellspacing="0" cellpadding="2" width="100%">'..table.concat(rows)..'</table>' end
+local function card(title,body,tag)
+ return '<table width="100%" cellspacing="0" cellpadding="7" bgcolor="#292929"><tr><td><font color="#f5f5f5"><b>'..E(title)..'</b></font>'..(tag and ' <font color="#ceab5a">'..E(tag)..'</font>' or '')..'<br/>'..body..'</td></tr></table><br/>'
+end
+local function bar(v,m,color)
+ if not v or not m or n(m)<=0 then return '' end
+ local p=pct(v,m)
+ return '<table width="100%" cellspacing="0" cellpadding="0"><tr><td style="background-color:#454545;height:7px"><div style="background-color:'..color..';height:7px;width:'..p..'%"></div></td></tr></table>'
+end
+local function unavailable(name) return '<div style="color:#aaaaaa;padding:12px">No '..E(name)..' received through the MUD protocol.</div>' end
+local function collection(t)
+ t=decode(t)
+ if type(t)~='table' then return nil end
+ if #t>0 then return t end
+ for _,k in ipairs({'MEMBERS','members','GROUP','group','QUESTS','quests','LIST','list','AFFECTS','affects','DATA','data'}) do
+   local sub=decode(t[k]); if type(sub)=='table' then if #sub>0 then return sub end end
+ end
+ local out={}; for k,v in pairs(t) do if type(v)=='table' then if not v.NAME and not v.name then v._key=k end; out[#out+1]=v end end
+ if #out>0 then table.sort(out,function(a,b) return tostring(field(a,'NAME','name','_key') or '')<tostring(field(b,'NAME','name','_key') or '') end);return out end
+ return nil
+end
+-- Player MSDP values may contain the MUD's tab color directives. These
+-- directives should not appear as visible letters or affect HTML layout.
+local function playerText(value)
+ local str=tostring(value==nil and '' or value)
+ return (str:gsub('\27%[[%d;]*[A-Za-z]','')
+   :gsub('\t%[[FB]%d%d%d%]','')
+   :gsub('\t[%a%+%-%_%=%*123]',''))
+end
+-- v0.8: a compact, web-client-style Player panel. The server is the
+-- authority for values; absent fields are shown as a dash, never guessed.
+local function webStat(label,value)
+ local shown=(value==nil or value=='') and '—' or tostring(value)
+ return '<td width="33%" bgcolor="#302c29" style="border:1px solid #584b3d;padding:6px">'..
+  '<table width="100%" cellspacing="0" cellpadding="0"><tr>'..
+  '<td align="left"><font color="#b9aa96" size="2">'..E(label)..'</font></td>'..
+  '<td align="right"><font color="#f1ece5" size="3"><b>'..E(playerText(shown))..'</b></font></td>'..
+  '</tr></table></td>'
+end
+local function webStats(labels)
+ local parts={'<table width="100%" cellspacing="4" cellpadding="0">'}
+ for i=1,#labels,3 do
+  parts[#parts+1]='<tr>'
+  for j=i,i+2 do
+   local k=labels[j]
+   parts[#parts+1]= k and webStat(k[1],k[2]) or '<td width="33%"></td>'
+  end
+  parts[#parts+1]='</tr>'
+ end
+ parts[#parts+1]='</table>'
+ return table.concat(parts)
+end
+local function webInfoLine(label,value,highlight)
+ if value==nil or value=='' then return '' end
+ local color=highlight or '#f0eae2'
+ return '<tr><td style="padding:5px 3px"><font color="#c5b7a6" size="2">'..E(label)..'</font></td>'..
+  '<td align="right" style="padding:5px 3px"><font color="'..color..'"><b>'..E(playerText(value))..'</b></font></td></tr>'
+end
+local function renderPlayer()
+ local name=any('CHARACTER_NAME'); local lvl=V('LEVEL');local cls=V('CLASS');local race=V('RACE')
+ if not name and not lvl then return unavailable('character data') end
+ name=playerText(name or 'Character')
+ local first,last=name:match('^(%S+)%s+(.+)$')
+ local title=first and ('<font color="#f5f1e9">'..E(first)..'</font> <font color="#e6bd57">'..E(last)..'</font>') or '<font color="#f5f1e9">'..E(name)..'</font>'
+ local subtitle={}
+ if lvl~=nil then subtitle[#subtitle+1]='Level '..playerText(lvl) end
+ if race~=nil and tostring(race)~='' then subtitle[#subtitle+1]=playerText(race) end
+ if cls~=nil and tostring(cls)~='' then subtitle[#subtitle+1]=playerText(cls) end
+ local abilities={}
+ for _,key in ipairs({'STR','DEX','CON','INT','WIS','CHA'}) do abilities[#abilities+1]={key,V(key)} end
+ local saves={
+  {'Fort',any('FORTITUDE','FORTITUDE_SAVE','FORT_SAVE')},
+  {'Refl',any('REFLEX','REFLEX_SAVE','REF_SAVE')},
+  {'Will',any('WILLPOWER','WILL_SAVE','WILLPOWER_SAVE')}
+ }
+ local lines={}
+ for _,p in ipairs({
+  {'Position',any('POSITION')},
+  {'Attack',any('ATTACK_BONUS','ATTACK')},
+  {'Armor Class',any('AC','ARMOR_CLASS')},
+  {'Alignment',any('ALIGNMENT')},
+  {'Damage',any('DAMAGE_BONUS')},
+  {'Gold',any('MONEY')},
+  {'Practice',any('PRACTICE')},
+  {'World time',any('WORLD_TIME')}
+ }) do
+  local tint=p[1]=='Alignment' and '#d8bc82' or nil
+  lines[#lines+1]=webInfoLine(p[1],p[2],tint)
+ end
+ return '<div style="padding:3px 1px 5px">'..
+  '<font size="5"><b>'..title..'</b></font><br/>'..
+  '<font color="#b7a99a" size="2">'..E(table.concat(subtitle,'  ·  '))..'</font></div>'..
+  webStats(abilities)..'<div style="height:5px"></div>'..webStats(saves)..
+  '<table width="100%" cellspacing="0" cellpadding="1">'..table.concat(lines)..'</table>'
+end
+-- Preserve the existing group frames but tighten them into MMO-style bars.
+-- Never infer another member's HP: only show values the server provided.
+local function partyResource(label,value,maximum,color)
+ local v=tonumber(value); local m=tonumber(maximum)
+ local textValue=(v and m and m>0) and (tostring(value)..' / '..tostring(maximum)) or '—'
+ local part={'<font size="2" color="#c4cad0">'..E(label)..': '..E(textValue)..'</font>'}
+ local fraction=(v and m and m>0) and pct(v,m) or 0
+ local fill=math.floor(fraction+0.5)
+ part[#part+1]='<table width="100%" cellspacing="0" cellpadding="0" bgcolor="#30363c"><tr>'
+ if fill>0 then part[#part+1]='<td bgcolor="'..color..'" width="'..fill..'%" height="9"></td>' end
+ if fill<100 then part[#part+1]='<td bgcolor="#30363c" height="9"></td>' end
+ part[#part+1]='</tr></table>'
+ return table.concat(part)
+end
+local function groupIsLeader(v)
+ if v==true or v==1 then return true end
+ local s=tostring(v or ''):lower()
+ return s=='true' or s=='1' or s=='yes' or s=='leader'
+end
+-- Combat fields are percentage-style health, not reliable absolute hit points.
+-- Keep the server's distinct group-resource values when they are available.
+local function combatHealth(value,maximum)
+ local v,m=tonumber(value),tonumber(maximum)
+ if not v then return '—',nil end
+ if m and m>0 then
+  local percent=pct(v,m)
+  return tostring(math.floor(percent+0.5))..'%',percent
+ end
+ -- Some Krynn servers send only the current percentage.
+ return tostring(math.floor(math.max(0,math.min(100,v))+0.5))..'%',math.max(0,math.min(100,v))
+end
+local function combatBar(value,maximum,color)
+ local shown,percent=combatHealth(value,maximum)
+ local fill=percent and math.floor(percent+0.5) or 0
+ return '<font size="2" color="#c4cad0">Health: '..E(shown)..'</font>'..
+  '<table width="100%" cellspacing="0" cellpadding="0" bgcolor="#30363c"><tr>'..
+  (fill>0 and '<td bgcolor="'..color..'" width="'..fill..'%" height="9"></td>' or '')..
+  (fill<100 and '<td bgcolor="#30363c" height="9"></td>' or '')..'</tr></table>'
+end
+local function combatName(value)
+ if value==nil then return '' end
+ local name=playerText(value):match('^%s*(.-)%s*$') or ''
+ if name=='0' or name:lower()=='none' or name:lower()=='null' then return '' end
+ return name
+end
+local function sameCombatName(a,b)
+ a=combatName(a):lower():gsub('[^%w]+',' '):match('^%s*(.-)%s*$') or ''
+ b=combatName(b):lower():gsub('[^%w]+',' '):match('^%s*(.-)%s*$') or ''
+ return a~='' and b~='' and (a==b or a:match('^%S+')==b:match('^%S+'))
+end
+local function renderGroup()
+ local html={}
+ local target=combatName(any('OPPONENT_NAME'))
+ local targetHP,targetMax=V('OPPONENT_HEALTH'),V('OPPONENT_HEALTH_MAX')
+ local targetLevel=V('OPPONENT_LEVEL')
+ local tank=combatName(any('TANK_NAME'))
+ local tankHP,tankMax=V('TANK_HEALTH'),V('TANK_HEALTH_MAX')
+ -- The target is first and uses the same compact resource-card look as party frames.
+ if target~='' then
+  local level=(tonumber(targetLevel) and tonumber(targetLevel)>0) and
+   '<font color="#c4cad0" size="2">Lv '..E(targetLevel)..'</font>' or ''
+  html[#html+1]='<table width="100%" cellspacing="0" cellpadding="0" bgcolor="#332c30">'..
+   '<tr><td width="5" bgcolor="#c76c60"></td><td style="padding:5px 7px;border:1px solid #795258">'..
+   '<table width="100%" cellspacing="0" cellpadding="0"><tr><td>'..
+   '<font color="#f3eee7"><b>'..E(target)..'</b></font></td>'..
+   '<td align="right"><font color="#ec978d" size="2"><b>TARGET</b></font>'..
+   (level~='' and ' &nbsp; '..level or '')..'</td></tr></table>'..
+   '<div style="height:5px"></div>'..combatBar(targetHP,targetMax,'#b95050')..'</td></tr></table><br/>'
+ else
+  html[#html+1]='<font color="#909aa3" size="2">No current combat target.</font><br/>'
+ end
+ local src=any('GROUP');local entries=collection(src)
+ if not entries then
+  if tank~='' then
+   html[#html+1]='<table width="100%" cellspacing="0" cellpadding="0" bgcolor="#353238">'..
+    '<tr><td width="5" bgcolor="#dc8954"></td><td style="padding:5px 7px;border:1px solid #986946">'..
+    '<font color="#f3eee7"><b>'..E(tank)..'</b></font> '.. 
+    '<font size="2" color="#f0b57a"><b>TANK</b></font><div style="height:5px"></div>'..
+    combatBar(tankHP,tankMax,'#d38a56')..'</td></tr></table><br/>'
+  end
+  html[#html+1]='<font color="#aeb4bc">'..((type(src)=='table' and next(src)==nil) and 'You are not currently in a group.' or 'No structured group members received.')..'</font>'
+  return table.concat(html)
+ end
+ local selfName=tostring(any('CHARACTER_NAME') or ''):lower()
+ local tankMatched=false
+ for _,m in ipairs(entries) do
+  local name,hp,hm,mv,mm,level,formation,leader
+  if type(m)=='table' then
+   name=field(m,'NAME','name','CHARACTER_NAME','character_name','SHORT','short','_key') or 'Group member'
+   hp=field(m,'HEALTH','health','HP','hp')
+   hm=field(m,'HEALTH_MAX','health_max','MAX_HEALTH','max_health','MAX_HP','max_hp')
+   mv=field(m,'MOVEMENT','movement','MOVE','move')
+   mm=field(m,'MOVEMENT_MAX','movement_max','MAX_MOVE','max_move')
+   level=field(m,'LEVEL','level')
+   formation=field(m,'FORMATION','formation','POSITION','position')
+   leader=groupIsLeader(field(m,'LEADER','leader','IS_LEADER','is_leader'))
+  elseif type(m)=='string' then name=m end
+  if name then
+   local isSelf=selfName~='' and tostring(name):lower()==selfName
+   if isSelf then
+    hp=hp or V('HEALTH'); hm=hm or V('HEALTH_MAX')
+    mv=mv or V('MOVEMENT'); mm=mm or V('MOVEMENT_MAX')
+    level=level or V('LEVEL')
+   end
+   local isTank=sameCombatName(name,tank)
+   if isTank then tankMatched=true end
+   local tags={}
+   if isTank then tags[#tags+1]='<font color="#f0b57a"><b>TANK</b></font>' end
+   if leader then tags[#tags+1]='<font color="#e1c47c"><b>LEADER</b></font>' end
+   if level~=nil then tags[#tags+1]='<font color="#c4cad0">Lv '..E(level)..'</font>' end
+   if formation~=nil and tostring(formation)~='' then tags[#tags+1]='<font color="#abb5bf">'..E(formation)..'</font>' end
+   local resources='<table width="100%" border="0" cellspacing="0" cellpadding="0"><tr>'..
+    '<td width="50%" valign="top" style="padding-right:5px">'..partyResource('HP',hp,hm,'#34845a')..'</td>'..
+    '<td width="50%" valign="top" style="padding-left:5px">'..partyResource('Move',mv,mm,'#317e9b')..'</td>'..
+    '</tr></table>'
+   if isTank and tankHP~=nil then
+    -- Separate the tank's MSDP percentage from group members' actual HP.
+    resources=resources..'<div style="height:3px"></div>'..combatBar(tankHP,tankMax,'#d38a56')
+   end
+   html[#html+1]='<table width="100%" cellspacing="0" cellpadding="0" bgcolor="'..(isTank and '#383136' or '#292f35')..'">'..
+    '<tr><td width="5" bgcolor="'..(isTank and '#dc8954' or (isSelf and '#d0a955' or '#607587'))..'"></td>'..
+    '<td style="padding:5px 7px;border:1px solid '..(isTank and '#986946' or '#47525c')..'">'..
+    '<table width="100%" cellspacing="0" cellpadding="0"><tr>'..
+    '<td><font color="#f3eee7"><b>'..E(playerText(name))..'</b></font></td>'..
+    '<td align="right"><font size="2">'..table.concat(tags,' &nbsp; ')..'</font></td>'..
+    '</tr></table><div style="height:5px"></div>'..resources..'</td></tr></table><br/>'
+  end
+ end
+ if tank~='' and not tankMatched then
+  -- The group payload can omit the current tank, e.g. another player or NPC.
+  html[#html+1]='<table width="100%" cellspacing="0" cellpadding="0" bgcolor="#353238">'..
+   '<tr><td width="5" bgcolor="#dc8954"></td><td style="padding:5px 7px;border:1px solid #986946">'..
+   '<font color="#f3eee7"><b>'..E(tank)..'</b></font> <font size="2" color="#f0b57a"><b>TANK</b></font>'..
+   '<div style="height:5px"></div>'..combatBar(tankHP,tankMax,'#d38a56')..'</td></tr></table><br/>'
+ end
+ return table.concat(html)
+end
+local clearScrollable
+-- The server's AFFECTS table is NOT a flat collection:
+-- { SPELL_LIKE_AFFECTS = {{NAME, LOCATION, MODIFIER, TYPE, DURATION}, ...},
+--   AFFECTED_BY = {{NAME, DESC}, ...} }
+-- The previous generic collection() missed both nested arrays.
+local function affectList(data,upper,lower)
+ local list=decode(field(data,upper,lower))
+ if type(list)~='table' then return nil end
+ local out={}
+ for _,a in ipairs(list) do out[#out+1]=decode(a) end
+ -- Some MSDP decoders present a 1-based array with string numeric keys.
+ if #out==0 then
+  local keys={}
+  for k,v in pairs(list) do if tonumber(k) and type(v)=='table' then keys[#keys+1]=k end end
+  table.sort(keys,function(a,b)return tonumber(a)<tonumber(b)end)
+  for _,k in ipairs(keys) do out[#out+1]=decode(list[k]) end
+ end
+ return out
+end
+local function affectEntries()
+ local data=any('AFFECTS')
+ if data==nil then return nil,'missing' end
+ if type(data)~='table' then return nil,'unknown' end
+ local spells=affectList(data,'SPELL_LIKE_AFFECTS','spell_like_affects')
+ local flags=affectList(data,'AFFECTED_BY','affected_by')
+ local out,counts={},{}
+ local function append(item,kind)
+  if type(item)~='table' then return end
+  local name=tostring(field(item,'NAME','name','SPELL','spell','_key') or 'Unknown effect')
+  local loc=field(item,'LOCATION','location')
+  local mod=field(item,'MODIFIER','modifier')
+  local dur=field(item,'DURATION','duration')
+  local typ=field(item,'TYPE','type')
+  local basis=table.concat({kind,name,tostring(loc or ''),tostring(mod or ''),tostring(typ or '')},'\31')
+  counts[basis]=(counts[basis] or 0)+1
+  out[#out+1]={key=basis..'#'..counts[basis],name=name,location=loc,
+   modifier=mod,duration=tonumber(dur),kind=kind}
+ end
+ if spells or flags then
+  for _,a in ipairs(spells or {}) do append(a,'spell') end
+  for _,a in ipairs(flags or {}) do append(a,'flag') end
+  return out,'known'
+ end
+ -- Support older variants containing a direct list of affects.
+ local direct={}
+ if #data>0 then
+  for _,a in ipairs(data) do direct[#direct+1]=a end
+ else
+  for _,v in pairs(data) do
+   if type(v)=='table' and field(v,'NAME','name','SPELL','spell','DURATION','duration')~=nil then
+    direct[#direct+1]=v
+   end
+  end
+ end
+ if #direct>0 then
+  for _,a in ipairs(direct) do append(a,'spell') end
+  return out,'known'
+ end
+ if next(data)==nil then return {},'known' end
+ return nil,'unknown'
+end
+-- The C server decrements durations once every 6 seconds, and reports
+-- whole rounds. A second-precision display therefore is approximate.
+function K.syncAffectsClock()
+ local entries,format=affectEntries()
+ if format~='known' then return end
+ local old=K.affectsClock or {}
+ local nextClock={}
+ local now=os.time()
+ for _,a in ipairs(entries) do
+  if a.kind=='spell' and a.duration and a.duration>=0 then
+   local previous=old[a.key]
+   if previous and previous.rounds==a.duration then
+    nextClock[a.key]=previous
+   else
+    -- Includes the not-yet-completed six-second server round.
+    nextClock[a.key]={rounds=a.duration,deadline=now+(a.duration+1)*6}
+   end
+  end
+ end
+ K.affectsClock=nextClock
+end
+local function durationDisplay(a)
+ if a.duration==nil then return '—' end
+ if a.duration<0 then return 'Permanent' end
+ local clock=(K.affectsClock or {})[a.key]
+ local seconds=math.max(0,math.floor((clock and clock.deadline or os.time()+a.duration*6)-os.time()))
+ local hours=math.floor(seconds/3600)
+ local minutes=math.floor(seconds/60)%60
+ local remaining=seconds%60
+ if hours>0 then return string.format('~%d:%02d:%02d',hours,minutes,remaining) end
+ return string.format('~%02d:%02d',math.floor(seconds/60),remaining)
+end
+local function affectText(a)
+ local function display(x) return x==nil and '—' or tostring(x) end
+ local modifier=display(a.modifier)
+ local m=tonumber(a.modifier)
+ if m and m>0 then modifier='+'..modifier end
+ return '<font color="#f0eadf" size="3"><b>'..E(a.name)..'</b></font>'..
+  '<br/><font color="#c6ced6" size="2">'..
+  'Location: <font color="#ffffff">'..E(display(a.location))..'</font>'..
+  ' &nbsp; | &nbsp; Modifier: <font color="#ffffff">'..E(modifier)..'</font>'..
+  ' &nbsp; | &nbsp; Duration: <font color="#e7c477">'..E(durationDisplay(a))..'</font></font>'
+end
+function K.clearAffectWidgets()
+ for _,widget in ipairs(K.affectWidgets or {}) do
+  pcall(function() widget:hide();widget:delete() end)
+ end
+ K.affectWidgets={};K.affectSignature=nil
+end
+-- Native Geyser labels: separate entries like the Room panel, but no buttons.
+-- Tick updates change the text in place, preserving scroll position.
+function K.renderAffectsPanel()
+ if not K.initialized or not K.visible then return end
+ local entries,state=affectEntries()
+ local signature=state
+ if state=='known' then
+  for _,a in ipairs(entries) do signature=signature..'|'..a.key end
+ end
+ if K.affectSignature~=signature then
+  clearScrollable('info')
+  K.clearAffectWidgets()
+  local y=5
+  local function addCard(html,height)
+   local label=Geyser.Label:new({name='KrynnNativeUI_Affect_'..tostring(#K.affectWidgets+1),
+      x=5,y=y,width='100%-29',height=height},K.infoScroll)
+   label:setStyleSheet('QLabel { background-color:#292f35; color:#eeeeee; border:1px solid #4a525b; padding:6px; qproperty-alignment: AlignTop; }')
+   label:echo(html)
+   K.affectWidgets[#K.affectWidgets+1]=label
+   y=y+height+5
+  end
+  if state=='missing' then
+   addCard('<font color="#b9b9b9">Waiting for the MUD to send AFFECTS data.</font>',41)
+  elseif state=='unknown' then
+   addCard('<font color="#ffb8a8">AFFECTS data received in an unrecognized format.</font>',44)
+  elseif #entries==0 then
+   addCard('<font color="#b9b9b9">No active effects.</font>',40)
+  else
+   for _,a in ipairs(entries) do addCard(affectText(a),56) end
+  end
+  -- Bottom spacer makes the content scroll even on Mudlet builds that
+  -- derive the ScrollBox extent from its children.
+  local spacer=Geyser.Label:new({name='KrynnNativeUI_Affect_spacer',
+    x=0,y=y,width=1,height=4},K.infoScroll)
+  spacer:setStyleSheet('background-color:transparent;border:0;')
+  K.affectWidgets[#K.affectWidgets+1]=spacer
+  K.affectSignature=signature
+ elseif state=='known' and #entries>0 then
+  for i,a in ipairs(entries) do
+   local label=K.affectWidgets[i]
+   if label then label:echo(affectText(a)) end
+  end
+ end
+end
+function K.startAffectsTimer()
+ if K.affectsTimer then pcall(killTimer,K.affectsTimer);K.affectsTimer=nil end
+ if not K.initialized then return end
+ K.affectsTimer=tempTimer(1,function()
+  K.affectsTimer=nil
+  if not K.initialized then return end
+  if K.visible and K.panel=='affects' then K.renderAffectsPanel() end
+  K.startAffectsTimer()
+ end)
+end
+-- v0.8 Quest tracker cleanup: retain the existing simple list and its
+-- actual values. No invented objectives, progress bars, or expand controls.
+local function renderQuests()
+ local data=any('QUESTS','QUEST','QUEST_INFO')
+ local entries=collection(data)
+ if not entries and type(data)=='table' and field(data,'NAME','name','TITLE','title','QUEST_NAME','quest_name') then
+  entries={data}
+ end
+ if not entries then
+  if type(data)=='table' and next(data)==nil then
+   return '<font color="#aeb4bc">No quests are currently tracked.</font>'
+  end
+  return unavailable('structured quest list')
+ end
+ local out={}
+ for _,q in ipairs(entries) do
+  if type(q)=='table' then
+   local name=field(q,'NAME','name','TITLE','title','QUEST_NAME','quest_name','_key') or 'Quest'
+   local status=field(q,'STATUS','status','STATE','state')
+   local progress=field(q,'PROGRESS','progress')
+   if type(progress)=='table' then
+    local current=field(progress,'CURRENT','current','DONE','done')
+    local total=field(progress,'TOTAL','total','REQUIRED','required')
+    progress=(current~=nil and total~=nil) and (tostring(current)..' / '..tostring(total)) or nil
+   end
+   local objective=field(q,'OBJECTIVE','objective','GOAL','goal')
+   local description=field(q,'DESCRIPTION','description','DETAILS','details')
+   local typ=field(q,'TYPE','type')
+   local info={}
+   local function addLine(label,v)
+    if v~=nil and v~='' and type(v)~='table' then
+     info[#info+1]='<font color="#bcb4a9" size="2">'..E(label)..':</font> <font color="#e6e8ea" size="2">'..E(v)..'</font>'
+    end
+   end
+   addLine('Status',status)
+   addLine('Progress',progress)
+   addLine('Objective',objective)
+   if description~=objective then addLine('Details',description) end
+   addLine('Type',typ)
+   local rows={}
+   for _,v in ipairs(info) do rows[#rows+1]='<div style="margin-top:3px">'..v..'</div>' end
+   out[#out+1]='<table width="100%" cellspacing="0" cellpadding="7" bgcolor="#292f35">'..
+    '<tr><td style="border:1px solid #4b535d">'..
+    '<font color="#edcf8b"><b>'..E(name)..'</b></font>'..
+    (#rows>0 and '<br/>'..table.concat(rows) or '')..'</td></tr></table><br/>'
+  else
+   out[#out+1]='<table width="100%" cellspacing="0" cellpadding="7" bgcolor="#292f35">'..
+    '<tr><td><font color="#edcf8b"><b>'..E(q)..'</b></font></td></tr></table><br/>'
+  end
+ end
+ return #out>0 and table.concat(out) or '<font color="#aeb4bc">No quests are currently tracked.</font>'
+end
+-- clearScrollable was forward-declared above for both Affects and Room renderers
+-- Both objects and NPCs use the FIRST word following the opening A/An as
+-- their default MUD keyword. The initial descriptive adjective is often a
+-- valid keyword on Krynn. Do not scan for verbs or select a later noun.
+-- For an opening "The", use the first following word as a fallback; otherwise
+-- use the first word of the line (e.g. "Mahir stands behind ...").
+-- The room description itself does not contain authoritative target IDs.
+local function roomKeyword(raw,kind)
+ local text=tostring(raw or ''):gsub('^%s*%[[^%]]+%]%s*',''):gsub('^%s+',''):gsub('%s+$','')
+ local word=text:match('^[Aa][Nn]?%s+([%a][%w_%-]*)')
+     or text:match('^[Tt][Hh][Ee]%s+([%a][%w_%-]*)')
+     or text:match('^([%a][%w_%-]*)')
+ return word and word:lower() or ''
+end
+-- A look line is not an authoritative MUD target ID. Auto-guess a keyword,
+-- but let the player explicitly override the target for each visible entry.
+local function roomEntryKey(kind,index)
+ return tostring(kind)..':'..tostring(index)
+end
+local function roomActionRows(kind,entries)
+ local result,counts={},{}
+ for index,description in ipairs(entries or {}) do
+  local key=roomEntryKey(kind,index)
+  local keyword=K.roomTargetOverrides[key] or roomKeyword(description,kind)
+  if keyword~='' then
+   counts[keyword]=(counts[keyword] or 0)+1
+   local target=counts[keyword]>1 and (tostring(counts[keyword])..'.'..keyword) or keyword
+   result[#result+1]={description=description,kind=kind,index=index,target=target,keyword=keyword}
+  else
+   result[#result+1]={description=description,kind=kind,index=index,target=nil,keyword=nil}
+  end
+ end
+ return result
+end
+function K.roomSelect(kind,index)
+ local key=roomEntryKey(kind,index)
+ K.roomSelected=(K.roomSelected==key) and nil or key
+ K.renderPanel()
+end
+function K.roomSetTarget(kind,index,keyword)
+ if kind~='object' and kind~='npc' then return false end
+ local contents=K.roomContents or {}
+ local entries=kind=='object' and contents.objects or contents.npcs
+ index=tonumber(index)
+ if not index or index%1~=0 or not entries or not entries[index] then return false end
+ keyword=tostring(keyword or ''):lower():match('^%s*(.-)%s*$')
+ if not keyword or not keyword:match('^[%w_%-]+$') then return false end
+ K.roomTargetOverrides[roomEntryKey(kind,index)]=keyword
+ K.roomSelected=roomEntryKey(kind,index)
+ K.renderPanel()
+ return true
+end
+function K.roomSend(action,item)
+ if not item or not item.target then
+  cecho('\n<yellow>Cannot identify a target keyword for this room entry.<reset>\n')
+  return
+ end
+ local legal={npc={kill=true,fire=true,lore=true,look=true},object={look=true,examine=true,read=true,get=true}}
+ if not (legal[item.kind] and legal[item.kind][action]) then return end
+ -- Explicit click only. No automatic attacks or pickups on a room refresh.
+ local cmd=action..' '..item.target
+ if type(send)=='function' then send(cmd) end
+end
+-- Explicitly delete old clickable widgets whenever this scroll panel rerenders.
+function K.clearRoomWidgets()
+ for _,widget in ipairs(K.roomWidgets or {}) do
+  pcall(function() widget:hide();widget:delete() end)
+ end
+ K.roomWidgets={}
+end
+function K.renderInteractiveRoom()
+ if not K.initialized or not K.visible then return end
+ clearScrollable('info')
+ K.clearRoomWidgets()
+ local y=5
+ local function addLabel(name,html,height,bg,onclick,tooltip)
+  local item=Geyser.Label:new({name='KrynnNativeUI_Room_'..name,x=5,y=y,width='100%-29',height=height},K.infoScroll)
+  item:setStyleSheet('background-color:'..(bg or '#202124')..';color:#eeeeee;border:1px solid #42454b;padding:3px;')
+  item:echo(html)
+  if onclick then item:setClickCallback(onclick) end
+  if tooltip then item:setToolTip(tooltip) end
+  K.roomWidgets[#K.roomWidgets+1]=item
+  y=y+height+3
+  return item
+ end
+ local function heading(label)
+  addLabel('heading'..y,'<font color="#e4c783"><b>'..E(label)..'</b></font>',25,'#292929')
+ end
+ local contents=K.roomContents or {objects={},npcs={},seen=false}
+ if not contents.seen then
+  addLabel('await','<font color="#b5b5b5">Enter a room or use look to capture its contents.</font>',38)
+ else
+  local types={
+   {label='Objects',kind='object',entries=contents.objects,actions={{'Look','look'},{'Examine','examine'},{'Read','read'},{'Get','get'}}},
+   {label='NPCs / Characters',kind='npc',entries=contents.npcs,actions={{'Attack','kill'},{'Fire','fire'},{'Lore','lore'},{'Look','look'}}}
+  }
+  for _,group in ipairs(types) do
+   if #group.entries>0 then
+    heading(group.label)
+    for _,entry in ipairs(roomActionRows(group.kind,group.entries)) do
+     local id=group.kind..entry.index
+     local selected=K.roomSelected==roomEntryKey(group.kind,entry.index)
+     local desc=E(entry.description)
+     local rowHeight=math.max(31,math.min(76,27+math.floor(#entry.description/65)*15))
+     local indicator=selected and '▾' or '▸'
+     addLabel('entity'..id,'<font color="#e0c783">'..indicator..'</font> '..desc,
+      rowHeight,selected and '#39444e' or '#292f35',
+      function() K.roomSelect(entry.kind,entry.index) end,'Click to '..(selected and 'hide' or 'show')..' actions')
+     if selected then
+      -- A target is a best-effort keyword only, not the description itself.
+      -- Allow the user to replace it with: kui target object 1 sword
+      local target=entry.target and E(entry.target) or '(unknown)'
+      addLabel('target'..id,
+       '<font color="#bcc7d3" size="2">Target: '..target..'  |  Set: kui target '..entry.kind..' '..entry.index..' WORD</font>',
+       26,'#20272e',nil,'Use kui target '..entry.kind..' '..entry.index..' WORD to correct targeting')
+      local buttons=group.actions
+      local avail=K.sidebarWidth-62
+      local cell=math.max(45,math.floor(avail/#buttons)-4)
+      local by=y
+      for bi,action in ipairs(buttons) do
+       local b=Geyser.Label:new({name='KrynnNativeUI_Room_btn_'..id..'_'..bi,
+        x=5+(bi-1)*(cell+4),y=by,width=cell,height=26},K.infoScroll)
+       local color=action[2]=='kill' and '#553737' or '#343f48'
+       b:setStyleSheet('background-color:'..color..';color:#e8eef5;border:1px solid #57606b;border-radius:3px;')
+       b:echo('<center><font size="2">'..E(action[1])..'</font></center>')
+       b:setClickCallback(function() K.roomSend(action[2],entry) end)
+       b:setToolTip(action[2]..' '..(entry.target or '?'))
+       K.roomWidgets[#K.roomWidgets+1]=b
+      end
+      y=y+29
+     end
+    end
+   end
+  end
+ end
+ heading('Room Information')
+ -- Room metadata is kept below the interactive contents.
+ local r=any('ROOM')
+ local name=V('ROOM_NAME') or field(r,'NAME','name') or 'Current room'
+ local area=V('AREA_NAME') or field(r,'AREA','area')
+ local details={'<font color="#f2e3b4"><b>'..E(name)..'</b></font>'}
+ if area then details[#details+1]='<br/>Area: '..E(area) end
+ local vnum=V('ROOM_VNUM') or field(r,'VNUM','vnum')
+ if vnum then details[#details+1]='<br/>Room number: '..E(vnum) end
+ local exits=any('ROOM_EXITS') or field(r,'EXITS','exits')
+ if type(exits)=='table' then
+  local dirs={'north','northeast','east','southeast','south','southwest','west','northwest','up','down','in','out'}
+  local visited={}
+  for _,dir in ipairs(dirs) do
+   if exits[dir]~=nil then details[#details+1]='<br/>Exit '..E(pretty(dir))..': '..E(scalar(exits[dir]));visited[dir]=true end
+  end
+  local extras={}
+  for dir,v in pairs(exits) do if not visited[dir] then extras[#extras+1]={dir,v} end end
+  table.sort(extras,function(a,b) return tostring(a[1])<tostring(b[1]) end)
+  for _,v in ipairs(extras) do details[#details+1]='<br/>Exit '..E(pretty(v[1]))..': '..E(scalar(v[2])) end
+ elseif exits then details[#details+1]='<br/>Exits: '..E(exits) end
+ local metaHeight=math.max(100,85+#details*23)
+ addLabel('metadata',table.concat(details),metaHeight,'#292929')
+ -- ScrollBox children are positioned absolutely; extend the scrollable area.
+ local spacer=Geyser.Label:new({name='KrynnNativeUI_Room_spacer',x=0,y=y,width=1,height=6},K.infoScroll)
+ spacer:setStyleSheet('background-color:transparent;border:0;')
+ K.roomWidgets[#K.roomWidgets+1]=spacer
+end
+-- Capture the section following the normal MUD '[ Exits: ... ]' line.
+-- This is ordinary MUD text, not a new protocol data source. No deduplication.
+local function renderContentsSection(heading,entries,noneText)
+ local out={'<font color="#e4c783"><b>'..E(heading)..'</b></font><br/>'}
+ if #entries==0 then
+  out[#out+1]='<font color="#a7a7a7">'..E(noneText)..'</font><br/>'
+ else
+  for _,entry in ipairs(entries) do
+   out[#out+1]='<font color="#e2e2e2">'..E(entry)..'</font><br/>'
+  end
+ end
+ return table.concat(out)
+end
+local function renderRoom()
+ local r=any('ROOM')
+ local name=V('ROOM_NAME') or field(r,'NAME','name') or 'Current room'
+ local area=V('AREA_NAME') or field(r,'AREA','area')
+ local contents=K.roomContents or {objects={},npcs={},seen=false}
+ local parts={}
+ if contents.seen then
+  parts[#parts+1]=card('Room Contents',
+    (#contents.objects>0 and renderContentsSection('Objects',contents.objects,'') or '')..
+    (#contents.npcs>0 and renderContentsSection('NPCs / Characters',contents.npcs,'') or ''))
+ else
+  parts[#parts+1]=card('Room Contents',
+    '<font color="#aaaaaa">Enter a room or use <b>look</b> to capture room contents.</font>')
+ end
+ local rows={line('Area',area),line('Room number',V('ROOM_VNUM') or field(r,'VNUM','vnum'))}
+ local exits=any('ROOM_EXITS') or field(r,'EXITS','exits')
+ if type(exits)=='table' then
+  local dirs={'north','northeast','east','southeast','south','southwest','west','northwest','up','down','in','out'}
+  local seen={}
+  for _,k in ipairs(dirs) do if exits[k]~=nil then rows[#rows+1]=line('Exit '..pretty(k),scalar(exits[k]));seen[k]=true end end
+  for k,v in pairs(exits) do if not seen[k] then rows[#rows+1]=line('Exit '..pretty(k),scalar(v)) end end
+ elseif exits then rows[#rows+1]=line('Exits',exits) end
+ parts[#parts+1]=card(name,tableRows(rows))
+ return table.concat(parts)
+end
+
+-- Called on each received text line; handles NPC markers like [!!], [-4], [?].
+-- Objects have no marker. Duplicate lines are retained in insertion order.
+function K.captureRoomLine(raw)
+ if type(raw)~='string' then return end
+ local text=raw:gsub('\r',''):gsub('\27%[[%d;]*[mK]',''):gsub('\t[%a]','')
+ -- The usual prompt (Gold:17095 PrepTime:...) ends the room contents.
+ local prompt=text:match('Gold:%s*%d+.-PrepTime:') or
+   text:match('PrepTime:%s*%[[^%]]+%].-Time:')
+ if text:match('^%s*%[%s*Exits:%s*[^%]]*%]') then
+  K.roomContents={objects={},npcs={},roomVnum=tostring(V('ROOM_VNUM') or ''),seen=true}
+  K.roomSelected=nil; K.roomTargetOverrides={}
+  K.roomCapture=true; K.roomLines=0
+  if K.panel=='room' then K.renderPanel() end
+  return
+ end
+ if not K.roomCapture then return end
+ if prompt then
+  K.roomCapture=false
+  if K.panel=='room' then K.renderPanel() end
+  return
+ end
+ K.roomLines=K.roomLines+1
+ if K.roomLines>100 then K.roomCapture=false;return end
+ text=text:match('^%s*(.-)%s*$')
+ if text=='' then
+  -- A blank line after the contents is the normal end of a room listing.
+  K.roomCapture=false
+  if K.panel=='room' then K.renderPanel() end
+  return
+ end
+ local marker=text:match('^(%[[^%]]+%])%s+.+$')
+ if marker then
+  K.roomContents.npcs[#K.roomContents.npcs+1]=text
+ elseif text:lower():match('^.+%s+from%s+the%s+.+$') then
+  -- Follower/character arrival notices belong under NPCs / Characters, not
+  -- Objects, and must NOT be discarded. Keep each original line separately.
+  -- The broad "? from the ?" rule applies only to unmarked lines.
+  K.roomContents.npcs[#K.roomContents.npcs+1]=text
+ else
+  K.roomContents.objects[#K.roomContents.objects+1]=text
+ end
+ -- Show contents immediately, even when a prompt line is suppressed or late.
+ if K.panel=='room' then K.renderPanel() end
+end
+-- Shared, static graphic-map sector palette and legend.
+-- Match the exact text colors from the live ASCII MINIMAP legend.
+-- The GRAPHIC_MAP room grid still uses its native sector IDs and geometry.
+local roomSectorColors={
+ [0]='#484d57',[1]='#eeeeee',[2]='#008800',[3]='#55ff55',
+ [4]='#aaaa00',[5]='#cc3333',[6]='#00aaaa',[7]='#3355cc',
+ [8]='#55ffff',[9]='#3355cc',[10]='#ffff55',[11]='#bbbbbb',
+ [12]='#ff55ff',[13]='#55aaff'
+}
+local roomSectorNames={
+ [0]='Inside',[1]='City',[2]='Field',[3]='Forest',
+ [4]='Hills',[5]='Mountain',[6]='Water (swim)',[7]='Water (boat)',
+ [8]='Flying',[9]='Underwater',[10]='Desert',[11]='Road',
+ [12]='Swamp',[13]='Ocean'
+}
+local function legendHeader(title,sub)
+ return '<font color="#e9e9e9"><b>'..E(title)..'</b></font><br/><font color="#b7c0c9">'..E(sub)..'</font><br/>'
+end
+local function legendTableOpen()
+ return '<table cellspacing="1" cellpadding="5" bgcolor="#252830" width="100%">'
+end
+local function legendSwatch(bg,description)
+ return '<tr><td bgcolor="'..bg..'" width="38" height="24">&nbsp;</td><td><font color="#e7e9ec">'..
+   E(description)..'</font></td></tr>'
+end
+local function legendMarker(symbol,description,fg,bg)
+ return '<tr><td width="38" height="24" align="center" bgcolor="'..(bg or '#252830')..
+   '"><font color="'..(fg or '#d5dce5')..'" face="Consolas" size="3"><b>'..
+   E(symbol)..'</b></font></td><td><font color="#e7e9ec">'..E(description)..'</font></td></tr>'
+end
+local function legendNote(msg)
+ return '<font color="#acb5c1">'..E(msg)..'</font><br/>'
+end
+local function legendGraphic()
+ local out={legendHeader('GRAPHIC MAP LEGEND','Room terrain colors'),legendTableOpen()}
+ for id=0,13 do
+  out[#out+1]=legendSwatch(roomSectorColors[id],roomSectorNames[id]..' ('..id..')')
+ end
+ out[#out+1]='</table><br/>'
+ out[#out+1]=legendHeader('MARKERS AND CONNECTIONS','Map symbols and exit directions')
+ out[#out+1]=legendTableOpen()
+ out[#out+1]=legendMarker('◆','Your current room (high-contrast marker)','#ffffff','#182d45')
+ out[#out+1]=legendMarker('','Regular room (solid terrain-colored square)',nil,roomSectorColors[1])
+ out[#out+1]=legendMarker('','Inside room (dark slate-gray)',nil,roomSectorColors[0])
+ out[#out+1]=legendMarker('━','East / West connection')
+ out[#out+1]=legendMarker('┃','North / South connection')
+ out[#out+1]=legendMarker('╱','Northeast / Southwest connection')
+ out[#out+1]=legendMarker('╲','Northwest / Southeast connection')
+ out[#out+1]=legendMarker('╳','Diagonal crossing')
+ out[#out+1]=legendMarker('↑','Up special exit (contrasting marker)','#fff4a8',roomSectorColors[0])
+ out[#out+1]=legendMarker('↓','Down special exit (contrasting marker)','#fff4a8',roomSectorColors[0])
+ out[#out+1]=legendMarker('↕','Up and down exits (contrasting marker)','#fff4a8',roomSectorColors[0])
+ out[#out+1]=legendMarker('•','In / out special exit (contrasting marker)','#fff4a8',roomSectorColors[0])
+ out[#out+1]=legendMarker('↑','Special exit on light terrain (dark marker)','#192543',roomSectorColors[10])
+ out[#out+1]='</table><br/>'
+ out[#out+1]=legendHeader('CONDITIONS','How the graphical map is interpreted')
+ out[#out+1]=legendNote('Connections are drawn from each room’s live GRAPHIC_MAP c bitmask.')
+ out[#out+1]=legendNote('The MUD can omit closed or hidden exits; an absent line is not necessarily a wall.')
+ out[#out+1]=legendNote('Terrain swatches follow ASCII terrain colors except Inside, deliberately darker for visibility.')
+ out[#out+1]=legendNote('Unknown terrain types appear as neutral gray squares.')
+ return table.concat(out)
+end
+-- v0.7.5: connections are shown ONLY when the protocol explicitly describes
+-- an exit, notably GRAPHIC_MAP v2 room.c. Adjacency is not a path.
+local directions={
+ n={0,-1,'s'},s={0,1,'n'},e={1,0,'w'},w={-1,0,'e'},
+ ne={1,-1,'sw'},nw={-1,-1,'se'},se={1,1,'nw'},sw={-1,1,'ne'}
+}
+local exitNames={
+ north='n',south='s',east='e',west='w',northeast='ne',
+ northwest='nw',southeast='se',southwest='sw',
+ north_east='ne',north_west='nw',south_east='se',south_west='sw',
+ up='u',down='d',inside='i',outside='o',['in']='i',out='o',
+ n='n',s='s',e='e',w='w',ne='ne',nw='nw',se='se',sw='sw',u='u',d='d',i='i',o='o'
+}
+local function explicitExits(r)
+ local result={}
+ -- GRAPHIC_MAP v2 connector bitmask, from the server's comm.c. The bits
+ -- describe EACH surrounding room, not only the player's current room.
+ -- 0=N, 1=E, 2=S, 3=W, 4=NW, 5=NE, 6=SE, 7=SW.
+ local mask=tonumber(field(r,'c','C'))
+ if mask and mask>=0 then
+  local keys={'n','e','s','w','nw','ne','se','sw'}
+  mask=math.floor(mask)
+  for bit,dir in ipairs(keys) do
+   if math.floor(mask/(2^(bit-1)))%2==1 then result[dir]='open' end
+  end
+  local specials=field(r,'sp','SP')
+  if type(specials)=='string' then
+   for marker in specials:lower():gmatch('[udio]') do result[marker]='open' end
+  end
+  -- An authoritative mask may be zero; do NOT infer a connection from
+  -- sector 's', indoors 'i', or from a nearby room's position.
+  return result
+ end
+ local src=field(r,'exits','EXITS','doors','DOORS','connections','CONNECTIONS')
+ src=decode(src)
+ local function record(name,val)
+  local key=exitNames[tostring(name):lower():gsub('[%s%-]','_')]
+  if not key then return end
+  if val==false or val==nil or val==0 or val=='0' or val=='false' or val=='none' then return end
+  if type(val)=='table' then
+   if field(val,'exists','EXISTS','available','AVAILABLE')==false then return end
+   if field(val,'closed','CLOSED','locked','LOCKED')==true then
+    result[key]='closed'
+   else result[key]='open' end
+  else result[key]='open' end
+ end
+ if type(src)=='table' then
+  for k,v in pairs(src) do
+   if type(k)=='number' then
+    if type(v)=='string' then record(v,true)
+    elseif type(v)=='table' then record(field(v,'dir','DIR','direction','DIRECTION'),v) end
+   else record(k,v) end
+  end
+ elseif type(src)=='string' then
+  for word in src:gmatch('[%w_]+') do record(word,true) end
+ end
+ -- Some implementations provide directional fields directly on the room.
+ for k,v in pairs(r) do
+  if type(k)=='string' then
+   local rawName=k:lower()
+   local name=rawName:gsub('^exit_',''):gsub('^door_','')
+   -- Abbreviated protocol room fields like s and i are NOT exits.
+   if (rawName:match('^exit_') or rawName:match('^door_')
+      or #name>2) and exitNames[name] then record(name,v) end
+  end
+ end
+ local sp=decode(field(r,'sp','SP','special_exits','SPECIAL_EXITS'))
+ if type(sp)=='table' then
+  for k,v in pairs(sp) do
+   if type(k)=='number' and type(v)=='string' then record(v,true)
+   else record(k,v) end
+  end
+ elseif type(sp)=='string' then
+  -- sp is special-exit flags, not proof of an ordinary connection.
+  for symbol in sp:lower():gmatch('[ud io]') do
+   if symbol~=' ' then record(symbol,true) end
+  end
+ end
+ return result
+end
+local function boxstyle(open,dir)
+ local v=open[dir]
+ if v=='closed' then return 'background-color:#995b3f;' end
+ return v and 'background-color:#d3b87c;' or 'background-color:transparent;'
+end
+-- Compact square-room map with separate directional connections.
+-- v0.7.6 tuned against a live Krynn GRAPHIC_MAP capture.
+-- Uses each room's `c` connector bitmask and `sp` special-exit flags.
+local function renderGraphicMap(raw)
+ if type(raw)~='table' then return nil,'GRAPHIC_MAP did not contain a room table' end
+ local rooms=decode(field(raw,'rooms','ROOMS'))
+ if type(rooms)~='table' then return nil,'GRAPHIC_MAP has no rooms array' end
+ local grid,count,maskCount,spCount={},0,0,0
+ local radius=math.max(1,math.min(20,tonumber(field(raw,'radius','RADIUS')) or 10))
+
+ for _,r0 in pairs(rooms) do
+  local r=decode(r0)
+  if type(r)=='table' then
+   local x=tonumber(field(r,'x','X'));local y=tonumber(field(r,'y','Y'))
+   if x and y and x%1==0 and y%1==0 and math.abs(x)<=radius and math.abs(y)<=radius then
+    grid[y..':'..x]=r;count=count+1
+    if field(r,'c','C')~=nil then maskCount=maskCount+1 end
+    local sp=field(r,'sp','SP')
+    if type(sp)=='string' and sp~='' then spCount=spCount+1 end
+   end
+  end
+ end
+ if count==0 then return nil,'No room coordinates in GRAPHIC_MAP' end
+ local cx=math.max(-radius,math.min(radius,K.graphX or 0))
+ local cy=math.max(-radius,math.min(radius,K.graphY or 0))
+ local zoom=K.graphZoom or 22
+ local half=(zoom<=16 and 6) or (zoom<=20 and 5) or 4
+ local nodePx=math.max(11,math.min(20,math.floor(zoom*0.72)))
+ local gapPx=math.max(7,math.floor(nodePx*0.72))
+ local occupancy={};local exitGrid={}
+ local function key(x,y) return y..':'..x end
+ for y=cy-half,cy+half do
+  for x=cx-half,cx+half do
+   local room=grid[key(x,y)]
+   if room then
+    occupancy[key(x,y)]=room
+    exitGrid[key(x,y)]=explicitExits(room)
+   end
+  end
+ end
+ if occupancy['0:0'] and field(occupancy['0:0'],'c','C')==nil then
+  local current=decode(any('ROOM_EXITS'))
+  if current~=nil then
+   local extras=explicitExits({exits=current})
+   for d,v in pairs(extras) do exitGrid['0:0'][d]=v end
+  end
+ end
+ local knownCount=0
+ local function has(x,y,d)
+  local e=exitGrid[key(x,y)]
+  return e and e[d] or nil
+ end
+ local function connected(x,y,dir,dx,dy,reverse)
+  if not occupancy[key(x,y)] or not occupancy[key(x+dx,y+dy)] then return nil end
+  local a=has(x,y,dir); local b=has(x+dx,y+dy,reverse)
+  if a=='closed' or b=='closed' then return 'closed' end
+  return a or b
+ end
+ local out={'<table align="center" cellspacing="0" cellpadding="0" bgcolor="#0f1115">'}
+ for gy=-half*2,half*2 do
+  out[#out+1]='<tr>'
+  for gx=-half*2,half*2 do
+   local roomX=cx+math.floor((gx+half*2)/2)-half
+   local roomY=cy+math.floor((gy+half*2)/2)-half
+   local evenX=(gx%2==0); local evenY=(gy%2==0)
+   local glyph=''; local bg='#0f1115'; local fg='#c7ced8'
+   local w=evenX and nodePx or gapPx
+   local h=evenY and nodePx or gapPx
+   if evenX and evenY then
+    local room=occupancy[key(roomX,roomY)]
+    if room then
+     local sector=tonumber(field(room,'s','S','sector','SECTOR'))
+     bg=roomSectorColors[sector] or '#7d858f'
+     local sp=tostring(field(room,'sp','SP') or ''):lower()
+     if roomX==0 and roomY==0 then
+      glyph='◆'; bg='#182d45'; fg='#ffffff'
+     else
+      -- Preserve terrain color while making special exits legible on both
+      -- dark inside rooms and bright desert/city/flying tiles.
+      local r,g,b=tonumber(bg:sub(2,3),16) or 0,tonumber(bg:sub(4,5),16) or 0,tonumber(bg:sub(6,7),16) or 0
+      local luminance=(r*299+g*587+b*114)/1000
+      local markerFg=luminance>=145 and '#192543' or '#fff4a8'
+      if sp:find('u',1,true) and sp:find('d',1,true) then
+       glyph='↕'; fg=markerFg
+      elseif sp:find('u',1,true) then
+       glyph='↑'; fg=markerFg
+      elseif sp:find('d',1,true) then
+       glyph='↓'; fg=markerFg
+      elseif sp:find('i',1,true) or sp:find('o',1,true) then
+       glyph='•'; fg=markerFg
+      else
+       -- Ordinary room: solid terrain color, no inner square.
+       glyph=''
+      end
+     end
+    end
+   elseif not evenX and evenY then
+    local state=connected(roomX,roomY,'e',1,0,'w')
+    if state then glyph='━━'; knownCount=knownCount+1 end
+    fg=state=='closed' and '#ff965c' or '#c6ced7'
+   elseif evenX and not evenY then
+    local state=connected(roomX,roomY,'s',0,1,'n')
+    if state then glyph='┃'; knownCount=knownCount+1 end
+    fg=state=='closed' and '#ff965c' or '#c6ced7'
+   else
+    local se=connected(roomX,roomY,'se',1,1,'nw')
+    local sw=connected(roomX+1,roomY,'sw',-1,1,'ne')
+    if se and sw then glyph='╳'; knownCount=knownCount+2
+    elseif se then glyph='╲'; knownCount=knownCount+1
+    elseif sw then glyph='╱'; knownCount=knownCount+1 end
+    fg=(se=='closed' or sw=='closed') and '#ff965c' or '#c6ced7'
+   end
+   out[#out+1]='<td width="'..w..'" height="'..h..'" bgcolor="'..bg..'" align="center" valign="middle"><font color="'..fg..'" face="Consolas" size="2"><b>'..(glyph~='' and E(glyph) or '&nbsp;')..'</b></font></td>'
+  end
+  out[#out+1]='</tr>'
+ end
+ out[#out+1]='</table><table align="center" cellpadding="2"><tr><td><font color="#b8b8b8" size="2">'
+ out[#out+1]='Colored rooms  ◆ You  ↑↓ Special  ━┃╱╲ Exits'
+ out[#out+1]='<br/>'..count..' rooms · '..maskCount..' with connector masks · '..spCount..' with special exits'
+ out[#out+1]='</font></td></tr></table>'
+ return table.concat(out),nil
+end
+-- ASCII legend is grounded in the server's src/movement/asciimap.c
+-- `map_info[]` table. Colors refer to the actual inner character; the
+-- square brackets around rooms use cyan in the game.
+local function legendAscii()
+ local sectors={
+  {'.','Inside', '#dddddd'},
+  {'C','City', '#eeeeee'},
+  {',','Field', '#008800'},
+  {'Y','Forest', '#55ff55'},
+  {'^','Hills', '#aaaa00'},
+  {'m','Mountain', '#cc3333'},
+  {'~','Water (swimmable)', '#00aaaa'},
+  {'=','Water (not swimmable)', '#3355cc'},
+  {'^','Flying', '#55ffff'},
+  {'U','Underwater', '#3355cc'},
+  {'X','Zone start', '#ff5555'},
+  {'|','Road, north–south', '#bbbbbb'},
+  {'-','Road, east–west', '#bbbbbb'},
+  {'+','Road intersection', '#bbbbbb'},
+  {'.','Desert', '#ffff55'},
+  {'o','Ocean', '#55aaff'},
+  {',','Marshland', '#ff55ff'},
+  {'M','High mountain', '#ff5555'},
+  {'.','Plains', '#bbbbbb'},
+  {'Y','Underdark wilderness', '#ff55ff'},
+  {'C','Underdark city', '#aa33aa'},
+  {'.','Underdark interior', '#aa33aa'},
+  {'~','Underdark water', '#aa33aa'},
+  {'=','Underdark impassable water', '#ff55ff'},
+  {'^','Underdark no ground', '#aa33aa'},
+  {'.','Lava', '#ff5555'},
+  {'|','Damaged road, north–south', '#aaaa00'},
+  {'-','Damaged road, east–west', '#aaaa00'},
+  {'+','Damaged road intersection', '#aaaa00'},
+  {'C','Cave', '#ff55ff'},
+  {'&','Jungle', '#008800'},
+  {'.','Tundra', '#eeeeee'},
+  {'A','Taiga', '#008800'},
+  {':','Beach', '#aaaa00'},
+  {'S','Seaport', '#ff5555'},
+  {'*','Interior room', '#aaaa00'},
+  {'~','River', '#00aaaa'}
+ }
+ local out={legendHeader('ASCII MAP LEGEND','Colored room symbols (from Krynn map definitions)'), legendTableOpen()}
+ for _,sector in ipairs(sectors) do
+  local symbol,name,color=sector[1],sector[2],sector[3]
+  out[#out+1]='<tr><td width="58" height="24" align="center" bgcolor="#16191d">'..
+   '<font face="Consolas" size="3" color="#00aaaa">[</font>'..
+   '<font face="Consolas" size="3" color="'..color..'"><b>'..E(symbol)..'</b></font>'..
+   '<font face="Consolas" size="3" color="#00aaaa">]</font>'..
+   '</td><td><font color="#e7e9ec">'..E(name)..'</font></td></tr>'
+ end
+ out[#out+1]='</table><br/>'
+ out[#out+1]=legendHeader('MARKERS AND CONNECTIONS','Player, locations and exits')
+ out[#out+1]=legendTableOpen()
+ out[#out+1]=legendMarker('[&]','Your current room (white ampersand)', '#eeeeee')
+ out[#out+1]=legendMarker('[$]','Shop (yellow dollar sign)', '#aaaa00')
+ out[#out+1]=legendMarker('[?]','Unusual or strange room', '#ff5555')
+ out[#out+1]=legendMarker('|','North / South exit')
+ out[#out+1]=legendMarker('-','East / West exit')
+ out[#out+1]=legendMarker('/','Diagonal exit')
+ out[#out+1]=legendMarker('\\','Diagonal exit')
+ out[#out+1]=legendMarker('+','Up exit or special junction (red)', '#cc3333')
+ out[#out+1]=legendMarker('-','Down exit marker (red)', '#cc3333')
+ out[#out+1]='</table><br/>'
+ out[#out+1]=legendHeader('CONDITIONS','How the ASCII map is interpreted')
+ out[#out+1]=legendNote('Each row above pairs a terrain symbol with its own text color; identical letters can mean different terrain when their colors differ.')
+ out[#out+1]=legendNote('The brackets surrounding a room are normally cyan. The player, shop, and unusual-room markers override the terrain symbol.')
+ out[#out+1]=legendNote('Map layout and characters are received from the live MINIMAP value. Invisible or closed exits may not appear.')
+ return table.concat(out)
+end
+-- Server MINIMAP contains protocol color escapes (TAB followed by a color code).
+-- Write to a native MiniConsole, not a QLabel: QLabel expands tabs and changes
+-- whitespace widths, destroying the map's fixed character grid.
+local mapColors={
+ n='reset',r='red',R='light_red',g='green',G='light_green',
+ b='blue',B='light_blue',y='yellow',Y='light_yellow',
+ m='magenta',M='light_magenta',c='cyan',C='light_cyan',
+ w='white',W='white',d='gray',D='light_gray',
+ a='cyan',A='light_cyan',j='green',J='light_green',
+ l='green',L='light_green',o='yellow',O='light_yellow',
+ p='magenta',P='light_magenta',t='yellow',T='light_yellow',
+ v='magenta',V='light_magenta'
+}
+local mapHex={
+ ['reset']='#dddddd',
+ ['red']='#cc3333',
+ ['light_red']='#ff5555',
+ ['green']='#008800',
+ ['light_green']='#55ff55',
+ ['blue']='#3355cc',
+ ['light_blue']='#55aaff',
+ ['yellow']='#aaaa00',
+ ['light_yellow']='#ffff55',
+ ['magenta']='#aa33aa',
+ ['light_magenta']='#ff55ff',
+ ['cyan']='#00aaaa',
+ ['light_cyan']='#55ffff',
+ ['white']='#eeeeee',
+ ['gray']='#777777',
+ ['light_gray']='#bbbbbb',
+}
+local function clearMapControls()
+ K.mapScroll:hide()
+ K.mapConsole:hide()
+ if K.mapDragSurface then K.mapDragSurface:hide() end
+ if K.graphicSurface then K.graphicSurface:hide() end
+end
+local function mapHTML()
+ if K.mapLegend then return K.mapMode=='graphic' and legendGraphic() or legendAscii() end
+ local raw=K.mapMode=='graphic' and any('GRAPHIC_MAP') or any('MINIMAP')
+ if raw==nil then return unavailable(K.mapMode=='graphic' and 'GRAPHIC_MAP' or 'MINIMAP') end
+ if K.mapMode=='graphic' then
+  local html,err=renderGraphicMap(raw)
+  return html or '<font color="#cccccc">'..E(err)..'</font>'
+ end
+ if type(raw)=='table' then raw=field(raw,'MAP','map','TEXT','text','ASCII','ascii') end
+ return '<pre>'..E(tostring(raw or ''))..'</pre>'
+end
+-- Text runs use the MiniConsole's foreground color directly; no cecho/decho
+-- markup is generated, so a literal '<' or a color specification never prints.
+local function drawAsciiMap(raw)
+ if type(raw)~='string' then return false end
+ raw=raw:gsub('\r',''):gsub('\27%[[%d;]*[A-Za-z]','')
+ local runs={}
+ local active='#dddddd'
+ local buffer={}
+ local function flush()
+  if #buffer>0 then
+   runs[#runs+1]={color=active,text=table.concat(buffer)}
+   buffer={}
+  end
+ end
+ local function setColor(color)
+  if color and color~=active then flush();active=color end
+ end
+ local i=1
+ while i<=#raw do
+  local ch=raw:sub(i,i)
+  if ch=='\t' and i<#raw then
+   local code=raw:sub(i+1,i+1)
+   if code=='[' then
+    local close=raw:find(']',i+2,true)
+    if close then
+     local token=raw:sub(i+2,close-1)
+     if token:match('^[FB]%d%d%d$') then
+      -- Palette directives are nonprintable color control codes.
+      i=close+1
+     elseif token:match('^U%d+/') then
+      buffer[#buffer+1]=token:match('/(.*)$') or '?';i=close+1
+     else
+      buffer[#buffer+1]=ch;i=i+1
+     end
+    else buffer[#buffer+1]=ch;i=i+1 end
+   elseif mapColors[code] then
+    setColor(mapHex[mapColors[code]] or '#dddddd');i=i+2
+   elseif code=='*' then buffer[#buffer+1]='@';i=i+2
+   elseif code=='_' or code=='+' or code=='-' or code=='=' or code:match('^[123]$') then
+    i=i+2
+   else buffer[#buffer+1]=ch;i=i+1 end
+  else
+   -- Treat ordinary glyphs, including angle brackets and spacing, literally.
+   buffer[#buffer+1]=ch
+   i=i+1
+  end
+ end
+ flush()
+ -- Decode the colorized map into visible character cells first. MSDP
+ -- escape sequences must never count as display columns.
+ local lines={{}}
+ local playerX,playerY,atX,atY
+ for _,run in ipairs(runs) do
+  for pos=1,#run.text do
+   local char=run.text:sub(pos,pos)
+   if char=='\n' then lines[#lines+1]={}
+   else
+    local row=#lines
+    local col=#lines[row]+1
+    lines[row][col]={char,run.color}
+    -- asciimap.c uses SECT_HERE = TAB W &: white ampersand is the
+    -- player marker. Forest/jungle may also use &, but in other colors.
+    if char=='&' and run.color=='#eeeeee' then playerX=col;playerY=row end
+    -- The older \t* marker is rendered as @. Retain it as a fallback.
+    if char=='@' then atX=col;atY=row end
+   end
+  end
+ end
+ if not playerX then playerX,playerY=atX,atY end
+ if not playerX then
+  -- No identifiable marker: keep the server map centered as a fallback.
+  playerY=math.max(1,math.floor((#lines+1)/2))
+  local longest=0
+  for _,line in ipairs(lines) do longest=math.max(longest,#line) end
+  playerX=math.max(1,math.floor((longest+1)/2))
+ end
+ -- Mudlet gives the actual visible columns and rows for this MiniConsole,
+ -- including the currently selected font and layout.  No fixed-size map or
+ -- pixel estimates are used for centering when these APIs are available.
+ local cols,rows
+ if type(getColumnCount)=='function' then
+  local ok,value=pcall(getColumnCount,K.mapConsole.name)
+  if ok and type(value)=='number' and value>3 then cols=math.floor(value) end
+ end
+ if type(getRowCount)=='function' then
+  local ok,value=pcall(getRowCount,K.mapConsole.name)
+  if ok and type(value)=='number' and value>2 then rows=math.floor(value) end
+ end
+ if not cols then cols=math.floor((K.sidebarWidth-16)/9) end
+ if not rows then
+  local _,h=getMainWindowSize()
+  rows=math.floor(((tonumber(h) or 900)-44)*K.mapSplit/100/18-5)
+ end
+ -- One spare column prevents terminal auto-wrap on the rightmost edge.
+ cols=math.max(5,math.min(250,cols-1))
+ rows=math.max(3,math.min(140,rows))
+ local middleX=math.floor((cols+1)/2)
+ local middleY=math.floor((rows+1)/2)
+ local sourceLeft=playerX-middleX-(K.panX or 0)
+ local sourceTop=playerY-middleY-(K.panY or 0)
+ local output={}
+ local function append(color,txt)
+  if txt=='' then return end
+  local prev=output[#output]
+  if prev and prev.color==color then prev.text=prev.text..txt
+  else output[#output+1]={color=color,text=txt} end
+ end
+ -- Crop (or pad) exactly to the current viewport, so the marker occupies
+ -- its center regardless of the sidebar width or map/info split height.
+ -- Never emit an extra newline after the last visible row: that would
+ -- scroll the MiniConsole and undo vertical centering.
+ for screenY=1,rows do
+  local cells=lines[sourceTop+screenY]
+  local lastNonBlank=0
+  local visible={}
+  for screenX=1,cols do
+   local cell=cells and cells[sourceLeft+screenX]
+   local char=cell and cell[1] or ' '
+   visible[screenX]={char,cell and cell[2] or '#dddddd'}
+   if char~=' ' then lastNonBlank=screenX end
+  end
+  for screenX=1,lastNonBlank do
+   local cell=visible[screenX]
+   append(cell[2],cell[1])
+  end
+  if screenY<rows then append('#dddddd','\n') end
+ end
+ K.mapConsole:clear()
+ local function rgb(hex)
+  local r,g,b=hex:match('^#(%x%x)(%x%x)(%x%x)$')
+  if not r then return 221,221,221 end
+  return tonumber(r,16),tonumber(g,16),tonumber(b,16)
+ end
+ for _,run in ipairs(output) do
+  setFgColor(K.mapConsole.name,rgb(run.color))
+  K.mapConsole:echo(run.text)
+ end
+ setFgColor(K.mapConsole.name,221,221,221)
+ return true
+end
+
+local function label(name,parent,x,y,w,h,html,css)
+ local l=Geyser.Label:new({name='KrynnNativeUI3_'..name,x=x,y=y,width=w,height=h},parent)
+ l:setStyleSheet(css or 'background-color:#262626;color:#eeeeee;border:1px solid #535353;padding:4px;')
+ l:echo('<table width="100%" cellspacing="0" cellpadding="0"><tr><td valign="top">'..(html or '')..'</td></tr></table>')
+ return l
+end
+local function button(name,parent,x,y,w,h,title,fn)
+ local b=label(name,parent,x,y,w,h,'<center>'..E(title)..'</center>','background-color:#363636;color:#eeeeee;border:1px solid #626262;border-radius:4px;padding:4px;font-size:11px;')
+ b:setClickCallback(fn)
+ return b
+end
+-- Chronicles of Krynn chat patterns (act.comm.c and act.wizard.c).
+-- Strip protocol colour controls, NOT visible characters, before matching.
+local function chatPlain(raw)
+ if type(raw)~='string' then return '' end
+ return raw:gsub('\r','')
+  :gsub('\27%[[%d;]*[A-Za-z]','')
+  :gsub('\t%[[FB]%d%d%d%]','')
+  :gsub('\t[%a]','')
+  :match('^%s*(.-)%s*$') or ''
+end
+function K.classifyChatLine(raw)
+ local text=chatPlain(raw)
+ if text=='' then return nil end
+ local fromHistory=nil
+ local hh,mm,body=text:match('^(%d%d):(%d%d)%s+(.+)$')
+ if hh and tonumber(hh)<24 and tonumber(mm)<60 then
+  fromHistory=hh..':'..mm
+  text=body
+ end
+ local lower=text:lower()
+ -- Staff-only wiznet/; channel; #level output is still prefixed [wiznet].
+ if lower:match('^%[wiznet%]%s+') then return 'immortal',text,fromHistory end
+ -- Group says have an explicit prefix; local group-say echo is different.
+ if lower:match('^%[group%]%s+') or lower:match('^you group%-say,') then return 'group',text,fromHistory end
+ -- Private tells from act.comm.c (both normal and failure-history variants).
+ if lower:match('^you tell .+,') or lower:match('^.+ tells you,')
+  or lower:match('^.+ told you,') then return 'tell',text,fromHistory end
+ -- Public commands: gossip/chat, shout, holler, auction, congrats,
+ -- quest-say, and their sender-visible counterparts.
+ if lower:match('^you quest%-say,') or lower:match('^.+ quest%-says,') then return 'channel',text,fromHistory end
+ local verbs={'chat','gossip','shout','holler','auctalk','congrat'}
+ for _,v in ipairs(verbs) do
+  if lower:match('^you '..v..',') or lower:match('^.+ '..v..'s,') then
+   return 'channel',text,fromHistory
+  end
+ end
+ -- Local IC speech: language-specific or plain, including OSAY.
+ -- CircleMUD says/asks/exclaims/mutters and speaker-visible forms.
+ local speech={'say','ask','exclaim','mutter'}
+ for _,v in ipairs(speech) do
+  if lower:match('^you '..v..'[,s ]') or lower:match('^.+ '..v..'s[, ]') then
+   if lower:find("'%s*",1) or lower:find(', ',1,true) then
+    return 'local',text,fromHistory
+   end
+  end
+ end
+ -- Direct whisper/ask messages are local communication, not tells.
+ if lower:match('^you whisper to .+,') or lower:match('^.+ whispers to you,')
+  or lower:match('^you ask .+,') or lower:match('^.+ asks you,') then
+  return 'local',text,fromHistory
+ end
+ return nil
+end
+-- Mudlet 4.8+ exposes the actual styled text of the current source line.
+-- Capture it in the trigger, rather than re-coloring the copied chat text.
+-- Copy only the matched visible message, so history HH:MM stamps stay in our
+-- own timestamp column. The two copies preserve colors for focused filters.
+local function chatRichText(text)
+ if type(copy2decho)~='function' or not text or text=='' then return nil end
+ local ok,result=pcall(copy2decho,'main',text)
+ if ok and type(result)=='string' and result~='' then return result end
+ return nil
+end
+local function focusedChatText(kind,text)
+ if kind=='immortal' then return (text:gsub('^%[wiznet%]%s*','')) end
+ if kind=='group' then return (text:gsub('^%[Group%]%s*','')) end
+ return text
+end
+local chatColors={tell={108,213,245},group={132,216,135},['local']={220,205,166},channel={239,196,115},immortal={204,150,249}}
+local chatLabels={all='All',tell='Tells',group='Group',['local']='Local',channel='Channels',immortal='Immortals'}
+function K.appendChat(entry)
+ if not K.chatConsole then return end
+ local rgb=chatColors[entry.kind] or {220,220,220}
+ local stamp=entry.time or '--:--:--'
+ setFgColor(K.chatConsole.name,141,152,163)
+ K.chatConsole:echo('['..stamp..'] ')
+ if K.chatFilter=='all' then
+  setFgColor(K.chatConsole.name,rgb[1],rgb[2],rgb[3])
+  K.chatConsole:echo('['..(chatLabels[entry.kind] or entry.kind)..'] ')
+ end
+ -- Copy the game's actual foreground/background color runs when available.
+ -- Fallback to plain echo if Mudlet cannot expose styled text for this line.
+ local focused=K.chatFilter~='all'
+ local shown=focused and focusedChatText(entry.kind,entry.text) or entry.text
+ local rich=focused and entry.focusedRich or entry.rich
+ local handled=false
+ if type(rich)=='string' and rich~='' and type(K.chatConsole.decho)=='function' then
+  handled=pcall(function() K.chatConsole:decho(rich) end)
+ end
+ if not handled then
+  setFgColor(K.chatConsole.name,234,237,241)
+  K.chatConsole:echo(shown)
+ end
+ K.chatConsole:echo('\n')
+end
+function K.stopChatFlash()
+ if K.chatFlashTimer then pcall(killTimer,K.chatFlashTimer);K.chatFlashTimer=nil end
+ K.chatFlashOn=false
+end
+function K.startChatFlash()
+ if K.chatFlashTimer or not K.initialized or not K.visible or
+    K.activeView=='chat' or K.chatUnread==0 then return end
+ K.chatFlashTimer=tempTimer(0.65,function()
+  K.chatFlashTimer=nil
+  if not K.initialized or not K.visible or K.activeView=='chat' or K.chatUnread==0 then
+   K.stopChatFlash(); return
+  end
+  K.chatFlashOn=not K.chatFlashOn
+  K.updateChatTabs()
+  K.startChatFlash()
+ end)
+end
+function K.updateChatTabs()
+ local active='background-color:#435c78;color:#ffffff;border:1px solid #7891aa;border-radius:4px;padding:4px;'
+ local idle='background-color:#303640;color:#dce4ee;border:1px solid #515d6c;border-radius:4px;padding:4px;'
+ local flash='background-color:#db9041;color:#111922;border:2px solid #ffd98e;border-radius:4px;padding:3px;'
+ local inChat=K.activeView=='chat'
+ if K.gameTab then K.gameTab:setStyleSheet(inChat and idle or active) end
+ if K.gameChatTab then
+  K.gameChatTab:setStyleSheet(inChat and active or (K.chatFlashOn and flash or idle))
+  local suffix=K.chatUnread>0 and (' ('..K.chatUnread..')') or ''
+  K.gameChatTab:echo('<center>Chat History'..suffix..'</center>')
+ end
+ if K.chatInfo then
+  local visible=0
+  for _,item in ipairs(K.chatHistory) do
+   if K.chatFilter=='all' or item.kind==K.chatFilter then visible=visible+1 end
+  end
+  K.chatInfo:echo('<font color="#c2d3e3"><b>Chat History</b> · '..visible..' shown · '..#K.chatHistory..' in session</font>')
+ end
+ for filter,control in pairs(K.chatFilterButtons or {}) do
+  control:setStyleSheet(filter==K.chatFilter and active or idle)
+ end
+end
+function K.renderChat()
+ if not K.chatConsole then return end
+ K.chatConsole:clear()
+ if #K.chatHistory==0 then
+  setFgColor(K.chatConsole.name,150,165,182)
+  K.chatConsole:echo('No chat messages captured yet. Incoming chat will appear here.\n')
+ end
+ for _,entry in ipairs(K.chatHistory) do
+  if K.chatFilter=='all' or entry.kind==K.chatFilter then K.appendChat(entry) end
+ end
+ if K.chatConsole.scrollToEnd then pcall(function() K.chatConsole:scrollToEnd() end) end
+ K.updateChatTabs()
+end
+function K.setChatFilter(filter)
+ if not chatLabels[filter] then return end
+ K.chatFilter=filter
+ K.renderChat()
+end
+-- Historical lines are printed with HH:MM by the server. An import may
+-- contain messages we already saw live. Count occurrences per import batch,
+-- so repeated identical messages are preserved but replaying history all
+-- doesn't duplicate earlier messages. Normal live messages are NEVER deduped.
+function K.captureChatLine(raw)
+ local kind,text,historyMinute=K.classifyChatLine(raw)
+ if not historyMinute then
+  K.historyBatchActive=false;K.historyBatchCounts={}
+ end
+ if not kind then return false end
+ if historyMinute then
+  if not K.historyBatchActive then
+   K.historyBatchActive=true;K.historyBatchCounts={}
+  end
+  local key=kind..'\0'..text
+  local occurrence=(K.historyBatchCounts[key] or 0)+1
+  K.historyBatchCounts[key]=occurrence
+  local present=0
+  for _,prior in ipairs(K.chatHistory) do
+   if prior.kind==kind and prior.text==text then present=present+1 end
+  end
+  if present>=occurrence then return true end
+ end
+ local entry={kind=kind,text=text,time=historyMinute or os.date('%H:%M:%S'),historical=(historyMinute~=nil)}
+ -- Read color runs while the source line is still Mudlet's active trigger line.
+ entry.rich=chatRichText(text)
+ local focusedText=focusedChatText(kind,text)
+ entry.focusedRich=(focusedText~=text) and chatRichText(focusedText) or entry.rich
+ K.chatHistory[#K.chatHistory+1]=entry
+ if #K.chatHistory>K.chatMax then table.remove(K.chatHistory,1) end
+ if K.activeView=='chat' and K.visible and
+  (K.chatFilter=='all' or K.chatFilter==kind) then
+  if #K.chatHistory==1 then K.renderChat() else K.appendChat(entry) end
+  if K.chatConsole and K.chatConsole.scrollToEnd then
+   pcall(function() K.chatConsole:scrollToEnd() end)
+  end
+ else
+  if K.activeView~='chat' then
+   K.chatUnread=math.min(999,K.chatUnread+1)
+   K.startChatFlash()
+  end
+ end
+ K.updateChatTabs()
+ return true
+end
+-- Clear affects this view only; All clears all categories and unread state.
+-- The MUD's own server-side history is not deleted.
+function K.clearChat(filter)
+ filter=filter or K.chatFilter
+ if not chatLabels[filter] then return end
+ if filter=='all' then
+  K.chatHistory={};K.chatUnread=0;K.stopChatFlash()
+ else
+  local retained={}
+  for _,entry in ipairs(K.chatHistory) do
+   if entry.kind~=filter then retained[#retained+1]=entry end
+  end
+  K.chatHistory=retained
+ end
+ K.historyBatchActive=false;K.historyBatchCounts={}
+ K.renderChat()
+end
+-- History queries use the exact supported Chronicles of Krynn channels.
+-- Group and combined Channels have no single history command; history all
+-- includes them without asking the server for an unsupported channel name.
+function K.loadChatHistory(filter)
+ filter=filter or K.chatFilter
+ local serverChannel=({all='all',tell='tell',group='all',
+  ['local']='say',channel='all',immortal='wiznet'})[filter]
+ if serverChannel then send('history '..serverChannel) end
+end
+function K.setView(view)
+ if view~='game' and view~='chat' then return end
+ K.activeView=view
+ if view=='chat' then K.chatUnread=0;K.stopChatFlash() end
+ if not K.visible or not K.initialized then return end
+ -- Both modes share the original sidebar and bottom-bar geometry.
+ setBorderRight(K.sidebarWidth);setBorderBottom(44)
+ if K.side then K.side:show() end
+ if K.bottom then K.bottom:show() end
+ if view=='chat' then
+  if K.sideBody then K.sideBody:hide() end
+  if K.chatView then K.chatView:show() end
+  K.renderChat()
+ else
+  if K.chatView then K.chatView:hide() end
+  if K.sideBody then K.sideBody:show() end
+  K.refresh()
+  K.requestAsciiCenter(true)
+ end
+ K.updateChatTabs()
+end
+
+clearScrollable=function(which)
+ if which=='info' then
+  if K.clearRoomWidgets then K.clearRoomWidgets() end
+  if K.clearAffectWidgets then K.clearAffectWidgets() end
+ end
+ local l=K[which..'Content']
+ if l then pcall(function() l:hide();l:delete() end) end
+ K[which..'Content']=nil
+end
+local function estimateHeight(html,which)
+ local _,tr=html:gsub('<tr','')
+ local _,br=html:gsub('<br','')
+ local _,div=html:gsub('<div','')
+ local _,pre=html:gsub('\n','')
+ local _,tables=html:gsub('<table','')
+ -- Content height, not an oversized fixed label: QLabel otherwise centers short text.
+ local height=18+tr*27+br*17+div*16+tables*14+pre*16
+ if which=='map' then
+  if K.mapLegend then
+   -- The graphic legend contains nested HTML tables and rows. The old
+   -- calculation ignored both, clipping everything below the first entries.
+   -- Give the scroll content its full height; ScrollBox handles the viewport.
+   -- Both legends use the same table-row based layout.
+   height=math.max(700, 165 + tr*38 + br*24 + tables*12)
+  else
+   height=(K.mapMode=='graphic') and 500 or (18+pre*18+br*18+div*20)
+  end
+ end
+ if which=='info' then
+  if K.panel=='player' then
+   -- title + two ability rows + saves + compact detail rows
+   local _,details=html:gsub('style="padding:5px 3px"','')
+   height=252+math.floor(details/2)*27
+  elseif K.panel=='group' then
+   -- One-line side-by-side HP and Move bars make each frame shorter.
+   local _,frames=html:gsub('bgcolor="#292f35"','')
+   local _,tankFrames=html:gsub('bgcolor="#383136"','')
+   local _,extraTank=html:gsub('bgcolor="#353238"','')
+   local _,targets=html:gsub('bgcolor="#332c30"','')
+   local _,tankBars=html:gsub('color="#f0b57a"','')
+   height=38+frames*83+tankFrames*105+targets*86+extraTank*78+tankBars*12
+  elseif K.panel=='quests' then
+   local _,quests=html:gsub('bgcolor="#292f35"','')
+   local _,detail=html:gsub('margin%-top:3px','')
+   height=20+quests*62+detail*22
+  end
+ end
+ return math.max(44,math.min(4200,height))
+end
+local function updateScrollable(which,html)
+ if not K.initialized or not K.visible or K.activeView~="game" then return end
+ clearScrollable(which)
+ local height=estimateHeight(html,which)
+ local l=label(which..'Dynamic',K[which..'Scroll'],0,0,'100%-20',height,html,
+  'QLabel { background-color:#181818; color:#eeeeee; border:0px; padding:6px; qproperty-alignment: AlignTop; }')
+ if l.setAlignment then pcall(function() l:setAlignment('left') end) end
+ K[which..'Content']=l
+end
+
+local function gauge(name,x,w,color)
+ local g=Geyser.Gauge:new({name='KrynnNativeUI3_'..name,x=x,y=8,width=w,height=27},K.bottom)
+ g:setColor(color)
+ g:echo(name)
+ return g
+end
+function K.updateGauges()
+ if not K.initialized or not K.visible then return end
+ local data={{K.hp,'HP',V('HEALTH'),V('HEALTH_MAX')},{K.psp,'PSP',V('PSP'),V('PSP_MAX')},{K.move,'Move',V('MOVEMENT'),V('MOVEMENT_MAX')}}
+ for _,d in ipairs(data) do local a,b=d[3],d[4];d[1]:setValue(pct(a,b),100);d[1]:echo(d[2]..'  '..(a~=nil and tostring(a) or '?')..' / '..(b~=nil and tostring(b) or '?')) end
+ local xp,tnl,xmax=V('EXPERIENCE'),V('EXPERIENCE_TNL'),V('EXPERIENCE_MAX')
+ local value=0;local txt='XP  '..tostring(xp or '?')
+ if xp and xmax and n(xmax)>n(xp) then value=pct(xp,xmax);txt='XP '..xp..' / '..xmax
+ elseif xp and tnl then txt='XP '..xp..' ('..tnl..' to next)' end
+ K.xp:setValue(value,100);K.xp:echo(txt)
+end
+-- A transparent mouse-capture label overlays the read-only map console.
+-- Geyser.Label supports press/move/release events in Mudlet 5.1.
+-- Mouse movement is translated to character/row offsets, not pixel positioning.
+local function mapEvent(event)
+ return type(event)=='table' and event or nil
+end
+function K.panStart(event)
+ event=mapEvent(event)
+ if not event or (event.button and tostring(event.button):lower():find('right')) then return end
+ K.panDrag={x=tonumber(event.x) or 0,y=tonumber(event.y) or 0,px=K.panX,py=K.panY}
+end
+function K.panMove(event)
+ event=mapEvent(event)
+ if not event or not K.panDrag or K.mapMode~='ascii' or K.mapLegend then return end
+ local dx=(tonumber(event.x) or K.panDrag.x)-K.panDrag.x
+ local dy=(tonumber(event.y) or K.panDrag.y)-K.panDrag.y
+ -- Character-cell measurements for 12pt Consolas; configurable if needed.
+ local x=math.max(-120,math.min(120,K.panDrag.px+math.floor(dx/9+0.5)))
+ local y=math.max(-80,math.min(80,K.panDrag.py+math.floor(dy/18+0.5)))
+ if x~=K.panX or y~=K.panY then
+  K.panX=x;K.panY=y
+  local raw=any('MINIMAP')
+  if type(raw)=='table' then raw=field(raw,'MAP','map','TEXT','text','ASCII','ascii') end
+  if type(raw)=='string' then drawAsciiMap(raw) end
+ end
+end
+function K.panStop() K.panDrag=nil end
+function K.panReset()
+ K.panX=0;K.panY=0;K.panDrag=nil;K.graphX=0;K.graphY=0;K.graphDrag=nil;K.renderMap()
+end
+-- Mouse callbacks for the graphical map. They receive local pixel coordinates.
+-- We move the *viewport* rather than moving the widgets, avoiding clipping.
+function K.graphStart(event)
+ if type(event)~='table' or (event.button and tostring(event.button):lower():find('right')) then return end
+ K.graphDrag={x=tonumber(event.globalX or event.x) or 0,y=tonumber(event.globalY or event.y) or 0,px=K.graphX,py=K.graphY}
+end
+function K.graphMove(event)
+ if type(event)~='table' or not K.graphDrag or K.mapMode~='graphic' or K.mapLegend then return end
+ local x=(tonumber(event.globalX or event.x) or K.graphDrag.x)-K.graphDrag.x
+ local y=(tonumber(event.globalY or event.y) or K.graphDrag.y)-K.graphDrag.y
+ local cell=math.max(12,math.min(22,math.floor((K.graphZoom or 22)*0.72)))+math.max(7,math.floor(math.max(12,math.min(22,math.floor((K.graphZoom or 22)*0.72)))*0.7))
+ local nx=math.max(-20,math.min(20,K.graphDrag.px-math.floor(x/cell+0.5)))
+ local ny=math.max(-20,math.min(20,K.graphDrag.py-math.floor(y/cell+0.5)))
+ if nx~=K.graphX or ny~=K.graphY then K.graphX=nx;K.graphY=ny;K.renderGraphic() end
+end
+function K.graphStop() K.graphDrag=nil end
+function K.graphWheel(event)
+ if K.mapMode~='graphic' or K.mapLegend then return end
+ local amount=type(event)=='table' and tonumber(event.angleDeltaY) or 0
+ if not amount or amount==0 then return end
+ local new=math.max(14,math.min(38,(K.graphZoom or 22)+(amount>0 and 2 or -2)))
+ if new~=K.graphZoom then K.graphZoom=new;K.renderGraphic() end
+end
+function K.graphReset()
+ K.graphX=0;K.graphY=0;K.graphDrag=nil;K.renderGraphic()
+end
+function K.renderGraphic()
+ if not K.initialized or not K.visible or K.mapMode~='graphic' or K.mapLegend or not K.graphicSurface then return end
+ local raw=any('GRAPHIC_MAP')
+ local html,err=raw and renderGraphicMap(raw) or nil,nil
+ if raw and not html then _,err=renderGraphicMap(raw) end
+ K.graphicSurface:echo(html or ('<font color="#aaaaaa">'..E(err or 'No GRAPHIC_MAP received through MSDP.')..'</font>'))
+end
+function K.renderMap()
+ if not K.initialized or not K.visible then return end
+ K.location:echo('<b>'..E(any('ROOM_NAME') or 'Current room')..'</b>')
+ clearMapControls()
+ if K.mapMode=='graphic' and not K.mapLegend then
+  K.graphicSurface:show()
+  K.renderGraphic()
+  return
+ end
+ if K.mapMode=='ascii' and not K.mapLegend then
+  local raw=any('MINIMAP')
+  if type(raw)=='table' then raw=field(raw,'MAP','map','TEXT','text','ASCII','ascii') end
+  if type(raw)=='string' then
+   K.mapConsole:show()
+   if K.mapDragSurface then K.mapDragSurface:show() end
+   drawAsciiMap(raw)
+   return
+  end
+ end
+ K.mapScroll:show()
+ updateScrollable('map',mapHTML())
+end
+
+-- Recalculate the ASCII crop after Mudlet/Geyser has finished resizing.
+-- Resize itself always recenters; manual drag panning is still available until
+-- the next resize or a double-click on the map.
+function K.requestAsciiCenter(resetPan)
+ if K.activeView~="game" then return end
+ if resetPan then K.panX=0;K.panY=0;K.panDrag=nil end
+ if not K.initialized or not K.visible or K.mapMode~='ascii' or K.mapLegend then return end
+ if K.asciiCenterPending then return end
+ K.asciiCenterPending=true
+ tempTimer(0,function()
+  K.asciiCenterPending=false
+  if K.initialized and K.visible and K.mapMode=='ascii' and not K.mapLegend then K.renderMap() end
+ end)
+end
+
+function K.renderPanel()
+ if not K.initialized or not K.visible or K.activeView~="game" then return end
+ local render={player=renderPlayer,quests=renderQuests,room=renderRoom,group=renderGroup}
+ if K.panel=='affects' then
+  local ok,err=pcall(K.renderAffectsPanel)
+  if not ok then updateScrollable('info','<font color="#ff9999">Affects render error: '..E(err)..'</font>') end
+ elseif K.panel=='room' then
+  local ok,err=pcall(K.renderInteractiveRoom)
+  if not ok then updateScrollable('info','<font color="#ff9999">Room interaction render error: '..E(err)..'</font>') end
+ else
+  local ok,html=pcall(render[K.panel] or renderPlayer)
+  updateScrollable('info',ok and html or ('<font color="#ff9999">Render error: '..E(html)..'</font>'))
+ end
+ K.infoTitle:echo('<b>'..({player='Player',quests='Quests',room='Room information',group='Group',affects='Affects'})[K.panel]..'</b>')
+end
+function K.setPanel(p) K.panel=p;K.renderPanel() end
+function K.setMap(mode,legend) K.mapMode=mode;K.mapLegend=legend;K.renderMap() end
+function K.refresh() if K.activeView~="game" then return end;K.updateGauges();K.renderMap();K.renderPanel() end
+function K.subscribe()
+ if type(sendMSDP)~='function' then return end
+ local keys={'CHARACTER_NAME','HEALTH','HEALTH_MAX','PSP','PSP_MAX','MOVEMENT','MOVEMENT_MAX','EXPERIENCE','EXPERIENCE_MAX','EXPERIENCE_TNL','LEVEL','RACE','CLASS','MONEY','POSITION','STR','DEX','CON','INT','WIS','CHA','AC','ATTACK_BONUS','DAMAGE_BONUS','ALIGNMENT','PRACTICE','FORTITUDE','REFLEX','WILLPOWER','AREA_NAME','ROOM_NAME','ROOM_VNUM','ROOM','ROOM_EXITS','MINIMAP','GRAPHIC_MAP','WORLD_TIME','GROUP','OPPONENT_NAME','OPPONENT_HEALTH','OPPONENT_HEALTH_MAX','OPPONENT_LEVEL','TANK_NAME','TANK_HEALTH','TANK_HEALTH_MAX','AFFECTS','QUEST','QUESTS','QUEST_INFO'}
+ for _,key in ipairs(keys) do pcall(sendMSDP,'REPORT',key) end
+end
+-- Resizable sidebar and map/info divider, without recreating any protocol handlers.
+local function uiClamp(value,minv,maxv)
+ return math.max(minv,math.min(maxv,math.floor(value+0.5)))
+end
+local function panelHeight()
+ local _,h=getMainWindowSize()
+ return math.max(350,(tonumber(h) or 900)-78)
+end
+function K.applyWidth(newWidth)
+ local windowWidth=getMainWindowSize()
+ K.sidebarWidth=uiClamp(tonumber(newWidth) or K.sidebarWidth,310,
+  math.max(310,math.min(800,(tonumber(windowWidth) or 1600)-360)))
+ if K.visible then setBorderRight(K.sidebarWidth) end
+ if K.side then
+  K.side:move('100%-'..K.sidebarWidth,nil)
+  K.side:resize(K.sidebarWidth,nil)
+ end
+ if K.initialized then K.requestAsciiCenter(true) end
+end
+function K.applySplit(newSplit)
+ K.mapSplit=uiClamp(tonumber(newSplit) or K.mapSplit,28,67)
+ if not K.side then return end
+ local top=K.mapSplit
+ local info=100-top
+ -- Keep every element in the existing containers and use percentages,
+ -- so a normal Mudlet window resize also updates the panes automatically.
+ K.mapScroll:resize(nil,top..'%-73')
+ K.mapConsole:resize(nil,top..'%-80')
+ K.mapDragSurface:resize(nil,top..'%-80')
+ K.graphicSurface:resize(nil,top..'%-80')
+ K.infoTitle:move(nil,top..'%')
+ for _,tab in ipairs(K.infoTabs or {}) do tab:move(nil,top..'%+31') end
+ K.infoScroll:move(nil,top..'%+66')
+ K.infoScroll:resize(nil,info..'%-76')
+ if K.splitHandle then K.splitHandle:move(nil,top..'%-7') end
+ if K.initialized then K.requestAsciiCenter(true) end
+end
+local function mouseXY(event)
+ -- getMousePosition reports coordinates relative to Mudlet's main window,
+ -- unaffected by label movement during an active drag.
+ if type(getMousePosition)=='function' then
+  local x,y=getMousePosition();if type(x)=='number' and type(y)=='number' then return x,y end
+ end
+ if type(event)=='table' then return tonumber(event.globalX or event.x),tonumber(event.globalY or event.y) end
+ return nil,nil
+end
+function K.widthStart(event)
+ local x=mouseXY(event)
+ if x then K.resizeWidthDrag={x=x,initial=K.sidebarWidth} end
+end
+function K.widthMove(event)
+ if not K.resizeWidthDrag then return end
+ local x=mouseXY(event);if not x then return end
+ local newWidth=K.resizeWidthDrag.initial-(x-K.resizeWidthDrag.x)
+ if math.abs(newWidth-K.sidebarWidth)>=2 then K.applyWidth(newWidth) end
+end
+function K.widthStop()
+ if not K.resizeWidthDrag then return end
+ K.resizeWidthDrag=nil;saveLayout();K.refresh()
+end
+function K.splitStart(event)
+ local _,y=mouseXY(event)
+ if y then K.resizeSplitDrag={y=y,initial=K.mapSplit} end
+end
+function K.splitMove(event)
+ if not K.resizeSplitDrag then return end
+ local _,y=mouseXY(event);if not y then return end
+ local split=K.resizeSplitDrag.initial+100*(y-K.resizeSplitDrag.y)/panelHeight()
+ if math.abs(split-K.mapSplit)>=1 then K.applySplit(split) end
+end
+function K.splitStop()
+ if not K.resizeSplitDrag then return end
+ K.resizeSplitDrag=nil;saveLayout();K.refresh()
+end
+function K.resetLayout()
+ K.applyWidth(435);K.applySplit(44);saveLayout();K.refresh()
+end
+function K.makeUI()
+ setBorderRight(K.sidebarWidth);setBorderBottom(44)
+ K.side=Geyser.Container:new({name='KrynnNativeUI3_sidebar',x='100%-'..K.sidebarWidth,y=0,width=K.sidebarWidth,height='100%-44'})
+ K.sideBody=Geyser.Container:new({name='KrynnNativeUI6_sideBody',x=0,y=34,width='100%',height='100%-34'},K.side)
+ K.gameTab=button('gameTab',K.side,5,2,'49%-7',29,'Game UI',function() K.setView('game') end)
+ K.gameChatTab=button('gameChatTab',K.side,'50%',2,'50%-5',29,'Chat History',function() K.setView('chat') end)
+ K.bottom=Geyser.Container:new({name='KrynnNativeUI3_bottom',x=0,y='100%-44',width='100%',height=44})
+ K.background=label('bg',K.sideBody,0,0,'100%','100%','','background-color:#1c1c1c;border:1px solid #555;')
+ K.location=label('location',K.sideBody,5,5,'100%-10',29,'Current room')
+ button('mg',K.sideBody,'1%',38,'24%',29,'Graphic',function() K.setMap('graphic',false) end)
+ button('mgl',K.sideBody,'26%',38,'23%',29,'Legend',function() K.setMap('graphic',true) end)
+ button('ma',K.sideBody,'50%',38,'24%',29,'ASCII',function() K.setMap('ascii',false) end)
+ button('mal',K.sideBody,'75%',38,'24%',29,'Legend',function() K.setMap('ascii',true) end)
+ K.mapScroll=Geyser.ScrollBox:new({name='KrynnNativeUI3_mapScroll',x=5,y=73,width='100%-10',height='43%-73'},K.sideBody)
+ K.mapConsole=Geyser.MiniConsole:new({name='KrynnNativeUI5_ASCII',x=7,y=75,width='100%-16',height='43%-80',color='black',autoWrap=false},K.sideBody)
+ K.mapConsole:setColor(22,22,22)
+ K.mapConsole:setFont('Consolas')
+ K.mapConsole:setFontSize(12)
+ K.mapConsole:hide()
+ -- Overlay captures mouse drag instead of selecting map text.
+ K.mapDragSurface=Geyser.Label:new({name='KrynnNativeUI_MapDrag',x=7,y=75,width='100%-16',height='43%-80'},K.sideBody)
+ K.mapDragSurface:setStyleSheet('background-color:transparent;border:0px;')
+ K.mapDragSurface:setToolTip('Drag to pan ASCII map. Double-click to reset.')
+ K.mapDragSurface:setClickCallback(function(event) K.panStart(event) end)
+ K.mapDragSurface:setMoveCallback(function(event) K.panMove(event) end)
+ K.mapDragSurface:setReleaseCallback(function(event) K.panStop() end)
+ K.mapDragSurface:setDoubleClickCallback(function(event) K.panReset() end)
+ K.mapDragSurface:setOnLeave(function() K.panStop() end)
+ K.mapDragSurface:hide()
+ -- Native Geyser Label is both a Qt-rendered tile canvas and mouse target.
+ K.graphicSurface=Geyser.Label:new({name='KrynnNativeUI7_Graphic',x=7,y=75,width='100%-16',height='43%-80'},K.sideBody)
+ K.graphicSurface:setStyleSheet('background-color:#141619;color:#eeeeee;border:0px;padding:0px;')
+ K.graphicSurface:setToolTip('Drag to pan; mouse wheel to zoom; double-click to recenter.')
+ K.graphicSurface:setClickCallback(function(event) K.graphStart(event) end)
+ K.graphicSurface:setMoveCallback(function(event) K.graphMove(event) end)
+ K.graphicSurface:setReleaseCallback(function(event) K.graphStop() end)
+ K.graphicSurface:setDoubleClickCallback(function(event) K.graphReset() end)
+ K.graphicSurface:setWheelCallback(function(event) K.graphWheel(event) end)
+ K.graphicSurface:setOnLeave(function() K.graphStop() end)
+ K.graphicSurface:hide()
+ if K.mapScroll.setStyleSheet then pcall(function() K.mapScroll:setStyleSheet('QScrollArea { background-color:#181818; border:0; } QWidget { background-color:#181818; }') end) end
+ K.infoTitle=label('infoTitle',K.sideBody,5,'44%','100%-10',27,'Player information')
+ K.infoTabs={}
+ for i,t in ipairs({{'Player','player'},{'Quests','quests'},{'Room','room'},{'Group','group'},{'Affects','affects'}}) do
+  K.infoTabs[#K.infoTabs+1]=button('tab_'..t[2],K.sideBody,((i-1)*20)..'%','44%+31','20%',29,t[1],function() K.setPanel(t[2]) end)
+ end
+ K.infoScroll=Geyser.ScrollBox:new({name='KrynnNativeUI3_infoScroll',x=5,y='44%+66',width='100%-10',height='56%-76'},K.sideBody)
+ if K.infoScroll.setStyleSheet then pcall(function() K.infoScroll:setStyleSheet('QScrollArea { background-color:#181818; border:0; } QWidget { background-color:#181818; }') end) end
+ -- Visible narrow handles overlay only the divider / left edge.
+ K.splitHandle=Geyser.Label:new({name='KrynnNativeUI_SplitHandle',x=9,y='44%-7',width='100%-18',height=9},K.sideBody)
+ K.splitHandle:setStyleSheet('background-color:#444c55;border-top:1px solid #6b7785;border-bottom:1px solid #252a30;')
+ K.splitHandle:setToolTip('Drag up/down to resize map and information panes.')
+ K.splitHandle:setClickCallback(function(e) K.splitStart(e) end)
+ K.splitHandle:setMoveCallback(function(e) K.splitMove(e) end)
+ K.splitHandle:setReleaseCallback(function() K.splitStop() end)
+ K.splitHandle:setDoubleClickCallback(function() K.applySplit(44);saveLayout();K.refresh() end)
+ K.widthHandle=Geyser.Label:new({name='KrynnNativeUI_WidthHandle',x=0,y=0,width=9,height='100%'},K.sideBody)
+ K.widthHandle:setStyleSheet('background-color:#485260;border-left:1px solid #8594a5;border-right:1px solid #23272c;')
+ K.widthHandle:setToolTip('Drag left/right to resize the Krynn sidebar. Double-click to reset width.')
+ K.widthHandle:setClickCallback(function(e) K.widthStart(e) end)
+ K.widthHandle:setMoveCallback(function(e) K.widthMove(e) end)
+ K.widthHandle:setReleaseCallback(function() K.widthStop() end)
+ K.widthHandle:setDoubleClickCallback(function() K.applyWidth(435);saveLayout();K.refresh() end)
+ K.applySplit(K.mapSplit)
+ K.applyWidth(K.sidebarWidth)
+ K.hp=gauge('HP','1%','23%',C.hp);K.psp=gauge('PSP','25%','23%',C.psp);K.move=gauge('Move','49%','23%',C.move);K.xp=gauge('XP','73%','26%',C.xp)
+ -- Chat is a second view of the same sidebar, not a fullscreen overlay.
+ -- The two header tabs are siblings and stay visible in either view.
+ K.chatView=Geyser.Container:new({name='KrynnNativeUI7_chatView',
+  x=0,y=34,width='100%',height='100%-34'},K.side)
+ K.chatBackground=label('chatBackground',K.chatView,0,0,'100%','100%','',
+  'background-color:#171c23;border:1px solid #555;')
+ local filters={{'All','all',0,0},{'Tells','tell',1,0},{'Group','group',2,0},
+  {'Local','local',0,1},{'Channels','channel',1,1},{'Immortals','immortal',2,1}}
+ K.chatFilterButtons={}
+ for _,item in ipairs(filters) do
+  K.chatFilterButtons[item[2]]=button('chatFilter_'..item[2],K.chatView,
+   (item[3]*33.3333)..'%+5',8+item[4]*32,'33.3333%-10',28,item[1],function() K.setChatFilter(item[2]) end)
+ end
+ K.chatInfo=label('chatInfo',K.chatView,8,76,'100%-16',24,'Chat History',
+  'background-color:#171c23;color:#b2c5d7;border:0px;padding:2px;')
+ K.chatConsole=Geyser.MiniConsole:new({name='KrynnNativeUI7_chatConsole',
+  x=7,y=104,width='100%-14',height='100%-150',autoWrap=true,color='black'},K.chatView)
+ K.chatConsole:setColor(21,25,31)
+ K.chatLoadButton=button('chatLoadHistory',K.chatView,7,'100%-41','49%-10',31,
+  'Load History',function() K.loadChatHistory(K.chatFilter) end)
+ K.chatClearButton=button('chatClear',K.chatView,'50%','100%-41','50%-7',31,
+  'Clear Chat',function() K.clearChat(K.chatFilter) end)
+ K.chatConsole:setFont('Consolas')
+ K.chatConsole:setFontSize(10)
+ K.chatView:hide()
+ K.initialized=true
+ K.updateChatTabs()
+end
+function K.hide()
+ if not K.visible then return end
+ K.resizeWidthDrag=nil;K.resizeSplitDrag=nil;K.visible=false
+ K.stopChatFlash()
+ if K.chatView then K.chatView:hide() end
+ if K.side then K.side:hide() end
+ if K.bottom then K.bottom:hide() end
+ setBorderRight(0);setBorderBottom(0)
+end
+function K.show()
+ if K.visible then return end
+ K.visible=true
+ setBorderRight(K.sidebarWidth);setBorderBottom(44)
+ if K.side then K.side:show() end
+ if K.bottom then K.bottom:show() end
+ if K.activeView=='chat' then
+  if K.sideBody then K.sideBody:hide() end
+  if K.chatView then K.chatView:show() end
+  K.renderChat()
+ else
+  if K.chatView then K.chatView:hide() end
+  if K.sideBody then K.sideBody:show() end
+  K.refresh()
+ end
+ K.startChatFlash()
+ K.updateChatTabs()
+end
+function K.shutdown()
+ K.stopChatFlash()
+ if K.affectsTimer then pcall(killTimer,K.affectsTimer);K.affectsTimer=nil end
+ if K.clearAffectWidgets then K.clearAffectWidgets() end
+ if K.clearRoomWidgets then K.clearRoomWidgets() end
+ K.resizeWidthDrag=nil;K.resizeSplitDrag=nil
+ for _,h in ipairs(K.handlers or {}) do pcall(killAnonymousEventHandler,h) end;K.handlers={}
+ if K.roomTriggerId then pcall(killTrigger,K.roomTriggerId);K.roomTriggerId=nil end
+ if K.aliasId then pcall(killAlias,K.aliasId);K.aliasId=nil end
+ if K.chatView then pcall(function() K.chatView:hide();K.chatView:delete() end);K.chatView=nil end
+ if K.side then pcall(function() K.side:hide();K.side:delete() end);K.side=nil end
+ if K.bottom then pcall(function() K.bottom:hide();K.bottom:delete() end);K.bottom=nil end
+ setBorderRight(0);setBorderBottom(0);K.initialized=false;K.visible=false
+end
+function K.status()
+ cecho('\n<cyan>Krynn Native UI v'..K.version..' protocol status:<reset>\n')
+ for _,k in ipairs({'HEALTH','HEALTH_MAX','ROOM_NAME','ROOM','MINIMAP','GRAPHIC_MAP','GROUP','AFFECTS','QUESTS','QUEST','QUEST_INFO'}) do
+  local v=V(k);cecho('  '..k..': '..(v==nil and '<red>not received' or '<green>received ('..type(v)..')')..'<reset>\n')
+ end
+end
+function K.roomDebug()
+ local c=K.roomContents or {}
+ cecho(string.format('\n<cyan>Krynn room capture:<reset> trigger=%s  active=%s  seen=%s  lines=%s  objects=%d  NPCs=%d  room=%s  protocolRoom=%s\n',
+  tostring(K.roomTriggerId or 'none'),tostring(K.roomCapture),tostring(c.seen),tostring(K.roomLines),
+  #(c.objects or {}),#(c.npcs or {}),tostring(c.roomVnum or '?'),tostring(V('ROOM_VNUM') or '?')))
+end
+function K.graphDebug()
+ local raw=any('GRAPHIC_MAP')
+ local rooms=type(raw)=='table' and decode(field(raw,'rooms','ROOMS')) or nil
+ if type(rooms)~='table' then cecho('\n<yellow>GRAPHIC_MAP: no structured room array received.\n');return end
+ local withMask, withConnections, maskSample=0,0,nil
+ for _,v in pairs(rooms) do
+  local r=decode(v)
+  if type(r)=='table' then
+   local c=tonumber(field(r,'c','C'))
+   if c then withMask=withMask+1;maskSample=maskSample or c;if c>0 then withConnections=withConnections+1 end end
+  end
+ end
+ cecho(string.format('\n<cyan>GRAPHIC_MAP: %d rooms, %d with connector mask, %d with nonzero connections, sample mask %s\n',#rooms,withMask,withConnections,tostring(maskSample)))
+end
+function K.command(arg)
+ arg=tostring(arg or ''):match('^%s*(.-)%s*$')
+ local kind,index,keyword=arg:lower():match('^target%s+(%a+)%s+(%d+)%s+([%w_%-]+)$')
+ if kind then
+  if K.roomSetTarget(kind,tonumber(index),keyword) then
+   cecho('\n<green>Room target updated: '..kind..' '..index..' -> '..keyword..'<reset>\n')
+  else cecho('\n<yellow>Invalid entry. Use: kui target object 1 sword<reset>\n') end
+  return
+ end
+ arg=arg:lower()
+ if arg=='hide' then K.hide() elseif arg=='show' then K.show() elseif arg=='off' then K.shutdown()
+ elseif arg=='refresh' then K.refresh() elseif arg=='connect' then K.subscribe();K.refresh()
+ elseif arg=='status' then K.status() elseif arg=='roomclear' then K.roomCapture=false;K.roomContents={objects={},npcs={},seen=false};K.roomSelected=nil;K.roomTargetOverrides={};K.renderPanel() elseif arg=='mapreset' then K.panReset()
+ elseif arg=='mapdebug' then K.graphDebug() elseif arg=='roomdebug' then K.roomDebug()
+ elseif arg=='chat' then K.setView('chat') elseif arg=='game' then K.setView('game')
+ elseif arg:match('^chat%s+(%a+)$') then K.setChatFilter(arg:match('^chat%s+(%a+)$'));K.setView('chat')
+ elseif arg:match('^width%s+%d+$') then K.applyWidth(tonumber(arg:match('%d+')));saveLayout();K.refresh()
+ elseif arg:match('^split%s+%d+$') then K.applySplit(tonumber(arg:match('%d+')));saveLayout();K.refresh()
+ elseif arg=='resetlayout' then K.resetLayout()
+ elseif arg=='mapin' then K.graphZoom=math.min(38,K.graphZoom+2);K.renderGraphic()
+ elseif arg=='mapout' then K.graphZoom=math.max(14,K.graphZoom-2);K.renderGraphic() elseif arg=='ascii' then K.setMap('ascii',false)
+ elseif arg=='graphic' then K.setMap('graphic',false) elseif arg=='legend' then K.setMap(K.mapMode,true)
+ elseif arg=='player' or arg=='quests' or arg=='room' or arg=='group' or arg=='affects' then K.setPanel(arg)
+ else cecho('\n<cyan>Krynn Native UI v0.8.10:<reset> kui show | hide | refresh | connect | status | off | ascii | graphic | legend | mapreset | mapin | mapout | mapdebug | width 500 | split 50 | resetlayout | game | chat | chat all/tell/group/local/channel/immortal | player | quests | room | roomclear | target object 1 sword | group | affects\n') end
+end
+K.makeUI()
+-- One trigger watches incoming room text. It does not hide or modify game output.
+-- This is deliberately limited to the portion after the room's Exits line.
+K.roomTriggerId=tempRegexTrigger('^.*$',function()
+ local incoming=matches and matches[1] or line or ''
+ if K.initialized then
+  if not K.captureChatLine(incoming) then K.captureRoomLine(incoming) end
+ end
+end)
+local watch={'CHARACTER_NAME','HEALTH','HEALTH_MAX','PSP','PSP_MAX','MOVEMENT','MOVEMENT_MAX','EXPERIENCE','EXPERIENCE_MAX','EXPERIENCE_TNL','LEVEL','RACE','CLASS','MONEY','POSITION','STR','DEX','CON','INT','WIS','CHA','AC','ATTACK_BONUS','DAMAGE_BONUS','ALIGNMENT','PRACTICE','FORTITUDE','REFLEX','WILLPOWER','AREA_NAME','ROOM_NAME','ROOM_VNUM','ROOM','ROOM_EXITS','MINIMAP','GRAPHIC_MAP','WORLD_TIME','GROUP','OPPONENT_NAME','OPPONENT_HEALTH','OPPONENT_HEALTH_MAX','OPPONENT_LEVEL','TANK_NAME','TANK_HEALTH','TANK_HEALTH_MAX','AFFECTS','QUEST','QUESTS','QUEST_INFO'}
+for _,key in ipairs(watch) do K.handlers[#K.handlers+1]=registerAnonymousEventHandler('msdp.'..key,function() if K.initialized then
+ if key=='AFFECTS' then K.syncAffectsClock() end
+ if key=='ROOM_VNUM' then
+  local room=V('ROOM_VNUM')
+  if room~=K.graphLastRoom then
+   K.graphLastRoom=room;K.graphX=0;K.graphY=0
+   -- Room look text and MSDP room updates can arrive in either order.
+   -- Do not discard entries captured after [ Exits: ... ] if the number
+   -- update arrives afterward. A new Exits line starts a fresh list.
+   if not (K.roomContents and K.roomContents.seen) then
+    K.roomCapture=false
+    K.roomContents={objects={},npcs={},roomVnum=tostring(room or ''),seen=false}
+    K.roomSelected=nil;K.roomTargetOverrides={}
+   else
+    K.roomContents.roomVnum=tostring(room or '')
+   end
+  end
+ end
+ K.refresh() end end) end
+-- Recenter on the real Mudlet window size / MiniConsole column changes.
+K.handlers[#K.handlers+1]=registerAnonymousEventHandler('sysWindowResizeEvent',function()
+ if K.initialized then K.requestAsciiCenter(true) end
+end)
+K.handlers[#K.handlers+1]=registerAnonymousEventHandler('sysConsoleSizeChanged',function(_,name)
+ if K.initialized and (name=='main' or (K.mapConsole and name==K.mapConsole.name)) then
+  K.requestAsciiCenter(true)
+ end
+end)
+K.handlers[#K.handlers+1]=registerAnonymousEventHandler('sysProtocolEnabled',function(_,proto) if tostring(proto):upper()=='MSDP' then K.subscribe() end end)
+K.handlers[#K.handlers+1]=registerAnonymousEventHandler('sysConnectionEvent',function() tempTimer(2,function() if K.initialized then K.subscribe() end end) end)
+K.aliasId=tempAlias('^kui(?:\\s+(.*))?$',function() K.command(matches[2]) end)
+K.syncAffectsClock();K.startAffectsTimer();K.refresh();K.subscribe();K.requestAsciiCenter(false)
+cecho('\n<cyan>Krynn Native UI v0.8.10 loaded.<reset> Use <yellow>kui status<reset> to inspect live protocol variables.\n')
