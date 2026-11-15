@@ -45,5 +45,7 @@ Available information depends on the server's MSDP fields and room-output format
 
 ## Related Chronicles of Krynn tools
 
+Browse the [Chronicles of Krynn tools directory](https://github.com/legimia/chronicles-of-krynn) for all tools and getting-started instructions.
+
 - [Color Text Editor](https://github.com/legimia/ansii-editor): offline colored description editing.
 - [Crafting Studio](https://github.com/legimia/crafting-studio): recipe planning, bonuses, and command generation.
