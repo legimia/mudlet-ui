@@ -1,4 +1,4 @@
-<?xml version='1.0' encoding='utf-8'?>
+<?xml version="1.0" encoding="utf-8"?>
 <MudletPackage version="1.001"><ScriptPackage><Script isActive="yes" isFolder="no"><name>Krynn Native UI v0.8.10</name><script>-- Krynn Native UI v0.8.10: Centered ASCII viewport, MSDP HUD and room look-output capture.
 -- The Room tab parses only the contents section after [ Exits: ... ].
 KrynnNativeUI = KrynnNativeUI or {}
@@ -1476,7 +1476,9 @@ function K.captureChatLine(raw)
    pcall(function() K.chatConsole:scrollToEnd() end)
   end
  else
-  if K.activeView~='chat' then
+  -- Sender echoes stay in history without announcing our own messages.
+  local speaker=text:lower():gsub('^%[group%]%s+',''):gsub('^%[wiznet%]%s+','')
+  if K.activeView~='chat' and not speaker:match('^you[%s:,]') then
    K.chatUnread=math.min(999,K.chatUnread+1)
    K.startChatFlash()
   end

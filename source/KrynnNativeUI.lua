@@ -1475,7 +1475,9 @@ function K.captureChatLine(raw)
    pcall(function() K.chatConsole:scrollToEnd() end)
   end
  else
-  if K.activeView~='chat' then
+  -- Sender echoes stay in history without announcing our own messages.
+  local speaker=text:lower():gsub('^%[group%]%s+',''):gsub('^%[wiznet%]%s+','')
+  if K.activeView~='chat' and not speaker:match('^you[%s:,]') then
    K.chatUnread=math.min(999,K.chatUnread+1)
    K.startChatFlash()
   end
